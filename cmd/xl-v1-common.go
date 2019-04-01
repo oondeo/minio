@@ -16,13 +16,17 @@
 
 package cmd
 
-import "path"
+import (
+	"context"
+	"path"
+	"sync"
+)
 
 // getLoadBalancedDisks - fetches load balanced (sufficiently randomized) disk slice.
 func (xl xlObjects) getLoadBalancedDisks() (disks []StorageAPI) {
 	// Based on the random shuffling return back randomized disks.
-	for _, i := range hashOrder(UTCNow().String(), len(xl.storageDisks)) {
-		disks = append(disks, xl.storageDisks[i-1])
+	for _, i := range hashOrder(UTCNow().String(), len(xl.getDisks())) {
+		disks = append(disks, xl.getDisks()[i-1])
 	}
 	return disks
 }
@@ -30,14 +34,14 @@ func (xl xlObjects) getLoadBalancedDisks() (disks []StorageAPI) {
 // This function does the following check, suppose
 // object is "a/b/c/d", stat makes sure that objects ""a/b/c""
 // "a/b" and "a" do not exist.
-func (xl xlObjects) parentDirIsObject(bucket, parent string) bool {
+func (xl xlObjects) parentDirIsObject(ctx context.Context, bucket, parent string) bool {
 	var isParentDirObject func(string) bool
 	isParentDirObject = func(p string) bool {
-		if p == "." {
+		if p == "." || p == "/" {
 			return false
 		}
 		if xl.isObject(bucket, p) {
-			// If there is already a file at prefix "p" return error.
+			// If there is already a file at prefix "p", return true.
 			return true
 		}
 		// Check if there is a file as one of the parent paths.
@@ -49,33 +53,66 @@ func (xl xlObjects) parentDirIsObject(bucket, parent string) bool {
 // isObject - returns `true` if the prefix is an object i.e if
 // `xl.json` exists at the leaf, false otherwise.
 func (xl xlObjects) isObject(bucket, prefix string) (ok bool) {
-	for _, disk := range xl.getLoadBalancedDisks() {
+	var errs = make([]error, len(xl.getDisks()))
+	var wg sync.WaitGroup
+	for index, disk := range xl.getDisks() {
 		if disk == nil {
 			continue
 		}
-		// Check if 'prefix' is an object on this 'disk', else continue the check the next disk
-		_, err := disk.StatFile(bucket, path.Join(prefix, xlMetaJSONFile))
-		if err == nil {
-			return true
-		}
-		// Ignore for file not found,  disk not found or faulty disk.
-		if isErrIgnored(err, xlTreeWalkIgnoredErrs...) {
-			continue
-		}
-		errorIf(err, "Unable to stat a file %s/%s/%s", bucket, prefix, xlMetaJSONFile)
-	} // Exhausted all disks - return false.
-	return false
-}
-
-// Calculate the space occupied by an object in a single disk
-func (xl xlObjects) sizeOnDisk(fileSize int64, blockSize int64, dataBlocks int) int64 {
-	numBlocks := fileSize / blockSize
-	chunkSize := getChunkSize(blockSize, dataBlocks)
-	sizeInDisk := numBlocks * chunkSize
-	remaining := fileSize % blockSize
-	if remaining > 0 {
-		sizeInDisk += getChunkSize(remaining, dataBlocks)
+		wg.Add(1)
+		go func(index int, disk StorageAPI) {
+			defer wg.Done()
+			// Check if 'prefix' is an object on this 'disk', else continue the check the next disk
+			fi, err := disk.StatFile(bucket, path.Join(prefix, xlMetaJSONFile))
+			if err != nil {
+				errs[index] = err
+				return
+			}
+			if fi.Size == 0 {
+				errs[index] = errCorruptedFormat
+				return
+			}
+		}(index, disk)
 	}
 
-	return sizeInDisk
+	wg.Wait()
+
+	// NOTE: Observe we are not trying to read `xl.json` and figure out the actual
+	// quorum intentionally, but rely on the default case scenario. Actual quorum
+	// verification will happen by top layer by using getObjectInfo() and will be
+	// ignored if necessary.
+	readQuorum := len(xl.getDisks()) / 2
+
+	return reduceReadQuorumErrs(context.Background(), errs, objectOpIgnoredErrs, readQuorum) == nil
+}
+
+// isObjectDir returns if the specified path represents an empty directory.
+func (xl xlObjects) isObjectDir(bucket, prefix string) (ok bool) {
+	var errs = make([]error, len(xl.getDisks()))
+	var wg sync.WaitGroup
+	for index, disk := range xl.getDisks() {
+		if disk == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int, disk StorageAPI) {
+			defer wg.Done()
+			// Check if 'prefix' is an object on this 'disk', else continue the check the next disk
+			entries, err := disk.ListDir(bucket, prefix, 1)
+			if err != nil {
+				errs[index] = err
+				return
+			}
+			if len(entries) > 0 {
+				errs[index] = errVolumeNotEmpty
+				return
+			}
+		}(index, disk)
+	}
+
+	wg.Wait()
+
+	readQuorum := len(xl.getDisks()) / 2
+
+	return reduceReadQuorumErrs(context.Background(), errs, objectOpIgnoredErrs, readQuorum) == nil
 }

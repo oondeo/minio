@@ -18,7 +18,7 @@ If you're aware of stand-alone Minio set up, the installation and running remain
 
 ## 1. Prerequisites
 
-Install Minio - [Minio Quickstart Guide](https://docs.minio.io/docs/minio).
+Install Minio - [Minio Quickstart Guide](https://docs.minio.io/docs/minio-quickstart-guide).
 
 ## 2. Run Minio on Shared Backend
 
@@ -31,12 +31,12 @@ To run Minio shared backend instances, you need to start multiple Minio servers 
 
 #### Minio shared mode on Ubuntu 16.04 LTS. 
 
-You'll need the path to the shared volume, e.g. `/mnt/nfs`. Then run the following commands on all the nodes you'd like to launch Minio.
+You'll need the path to the shared volume, e.g. `/path/to/nfs-volume`. Then run the following commands on all the nodes you'd like to launch Minio.
 
 ```sh
 export MINIO_ACCESS_KEY=<ACCESS_KEY>
 export MINIO_SECRET_KEY=<SECRET_KEY>
-minio server /mnt/nfs
+minio gateway nas /path/to/nfs-volume
 ```
 
 #### Minio shared mode on Windows 2012 Server
@@ -46,7 +46,7 @@ You'll need the path to the shared volume, e.g. `\\remote-server\smb`. Then run 
 ```cmd
 set MINIO_ACCESS_KEY=my-username
 set MINIO_SECRET_KEY=my-password
-minio.exe server \\remote-server\smb\export
+minio.exe gateway nas \\remote-server\smb\export
 ```
 
 *Windows Tip*
@@ -57,7 +57,7 @@ If a remote volume, e.g. `\\remote-server\smb` is mounted as a drive, e.g. `M:\`
 set MINIO_ACCESS_KEY=my-username
 set MINIO_SECRET_KEY=my-password
 net use m: \\remote-server\smb\export /P:Yes
-minio.exe server M:\export
+minio.exe gateway nas M:\export
 ```
 
 ## 3. Test your setup

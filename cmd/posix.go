@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,36 +17,65 @@
 package cmd
 
 import (
-	"bytes"
+	"context"
 	"encoding/hex"
-	"hash"
 	"io"
 	"io/ioutil"
 	"os"
 	slashpath "path"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
+
+	"bytes"
 
 	humanize "github.com/dustin/go-humanize"
+	"github.com/minio/minio/cmd/logger"
 	"github.com/minio/minio/pkg/disk"
+	"github.com/minio/minio/pkg/mountinfo"
 )
 
 const (
-	diskMinFreeSpace   = 1 * humanize.GiByte // Min 1GiB free space.
-	diskMinTotalSpace  = diskMinFreeSpace    // Min 1GiB total space.
-	diskMinFreeInodes  = 10000               // Min 10000 free inodes.
-	diskMinTotalInodes = diskMinFreeInodes   // Min 10000 total inodes.
-	maxAllowedIOError  = 5
+	diskMinFreeSpace  = 900 * humanize.MiByte // Min 900MiB free space.
+	diskMinTotalSpace = diskMinFreeSpace      // Min 900MiB total space.
+	maxAllowedIOError = 5
 )
+
+// isValidVolname verifies a volname name in accordance with object
+// layer requirements.
+func isValidVolname(volname string) bool {
+	if len(volname) < 3 {
+		return false
+	}
+
+	if runtime.GOOS == "windows" {
+		// Volname shouldn't have reserved characters in Windows.
+		return !strings.ContainsAny(volname, `\:*?\"<>|`)
+	}
+
+	return true
+}
 
 // posix - implements StorageAPI interface.
 type posix struct {
-	ioErrCount int32 // ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
-	diskPath   string
-	pool       sync.Pool
+	// Disk usage metrics
+	totalUsed  uint64 // ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+	ioErrCount int32  // ref: https://golang.org/pkg/sync/atomic/#pkg-note-BUG
+
+	diskPath  string
+	pool      sync.Pool
+	connected bool
+
+	diskMount bool // indicates if the path is an actual mount.
+	driveSync bool // indicates if the backend is synchronous.
+
+	diskFileInfo os.FileInfo
+	// Disk usage metrics
+	stopUsageCh chan struct{}
 }
 
 // checkPathLength - returns error if given path name length more than 255
@@ -56,8 +85,10 @@ func checkPathLength(pathName string) error {
 		return errFileNameTooLong
 	}
 
-	// Convert any '\' to '/'.
-	pathName = filepath.ToSlash(pathName)
+	if runtime.GOOS == "windows" {
+		// Convert any '\' to '/'.
+		pathName = filepath.ToSlash(pathName)
+	}
 
 	// Check each path segment length is > 255
 	for len(pathName) > 0 && pathName != "." && pathName != "/" {
@@ -72,28 +103,69 @@ func checkPathLength(pathName string) error {
 	return nil
 }
 
+func getValidPath(path string) (string, error) {
+	if path == "" {
+		return path, errInvalidArgument
+	}
+
+	var err error
+	// Disallow relative paths, figure out absolute paths.
+	path, err = filepath.Abs(path)
+	if err != nil {
+		return path, err
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil && !os.IsNotExist(err) {
+		return path, err
+	}
+	if os.IsNotExist(err) {
+		// Disk not found create it.
+		if err = os.MkdirAll(path, 0777); err != nil {
+			return path, err
+		}
+	}
+	if fi != nil && !fi.IsDir() {
+		return path, syscall.ENOTDIR
+	}
+
+	di, err := getDiskInfo(path)
+	if err != nil {
+		return path, err
+	}
+	if err = checkDiskMinTotal(di); err != nil {
+		return path, err
+	}
+
+	// check if backend is writable.
+	file, err := os.Create(pathJoin(path, ".writable-check.tmp"))
+	if err != nil {
+		return path, err
+	}
+	defer os.Remove(pathJoin(path, ".writable-check.tmp"))
+	file.Close()
+
+	return path, nil
+}
+
 // isDirEmpty - returns whether given directory is empty or not.
 func isDirEmpty(dirname string) bool {
-	f, err := os.Open(preparePath(dirname))
+	f, err := os.Open((dirname))
 	if err != nil {
-		errorIf(func() error {
-			if !os.IsNotExist(err) {
-				return err
-			}
-			return nil
-		}(), "Unable to access directory.")
+		if !os.IsNotExist(err) {
+			logger.LogIf(context.Background(), err)
+		}
+
 		return false
 	}
 	defer f.Close()
 	// List one entry.
 	_, err = f.Readdirnames(1)
 	if err != io.EOF {
-		errorIf(func() error {
-			if !os.IsNotExist(err) {
-				return err
-			}
-			return nil
-		}(), "Unable to list directory.")
+		if !os.IsNotExist(err) {
+			logger.LogIf(context.Background(), err)
+		}
+
 		return false
 	}
 	// Returns true if we have reached EOF, directory is indeed empty.
@@ -101,17 +173,18 @@ func isDirEmpty(dirname string) bool {
 }
 
 // Initialize a new storage disk.
-func newPosix(path string) (StorageAPI, error) {
-	if path == "" {
-		return nil, errInvalidArgument
+func newPosix(path string) (*posix, error) {
+	var err error
+	if path, err = getValidPath(path); err != nil {
+		return nil, err
 	}
-	// Disallow relative paths, figure out absolute paths.
-	diskPath, err := filepath.Abs(path)
+	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	st := &posix{
-		diskPath: diskPath,
+	p := &posix{
+		connected: true,
+		diskPath:  path,
 		// 1MiB buffer pool for posix internal operations.
 		pool: sync.Pool{
 			New: func() interface{} {
@@ -119,33 +192,26 @@ func newPosix(path string) (StorageAPI, error) {
 				return &b
 			},
 		},
+		stopUsageCh:  make(chan struct{}),
+		diskFileInfo: fi,
+		diskMount:    mountinfo.IsLikelyMountPoint(path),
 	}
-	fi, err := osStat(preparePath(diskPath))
-	if err == nil {
-		if !fi.IsDir() {
-			return nil, syscall.ENOTDIR
-		}
-	}
-	if os.IsNotExist(err) {
-		// Disk not found create it.
-		err = mkdirAll(diskPath, 0777)
+
+	var pf BoolFlag
+	if driveSync := os.Getenv("MINIO_DRIVE_SYNC"); driveSync != "" {
+		pf, err = ParseBoolFlag(driveSync)
 		if err != nil {
 			return nil, err
 		}
+		p.driveSync = bool(pf)
 	}
 
-	di, err := getDiskInfo(preparePath(diskPath))
-	if err != nil {
-		return nil, err
-	}
-
-	// Check if disk has minimum required total space.
-	if err = checkDiskMinTotal(di); err != nil {
-		return nil, err
+	if !p.diskMount {
+		go p.diskUsage(GlobalServiceDoneCh)
 	}
 
 	// Success.
-	return st, nil
+	return p, nil
 }
 
 // getDiskInfo returns given disk information.
@@ -166,7 +232,6 @@ func getDiskInfo(diskPath string) (di disk.Info, err error) {
 var ignoreDiskFreeOS = []string{
 	globalWindowsOSName,
 	globalNetBSDOSName,
-	globalSolarisOSName,
 }
 
 // check if disk total has minimum required size.
@@ -175,20 +240,8 @@ func checkDiskMinTotal(di disk.Info) (err error) {
 	// used for journalling, inodes etc.
 	totalDiskSpace := float64(di.Total) * 0.95
 	if int64(totalDiskSpace) <= diskMinTotalSpace {
-		return errDiskFull
+		return errMinDiskSize
 	}
-
-	// Some filesystems do not implement a way to provide total inodes available, instead
-	// inodes are allocated based on available disk space. For example CephDISK, StoreNext CVDISK,
-	// AzureFile driver. Allow for the available disk to be separately validated and we will
-	// validate inodes only if total inodes are provided by the underlying filesystem.
-	if di.Files != 0 && di.FSType != "NFS" {
-		totalFiles := int64(di.Files)
-		if totalFiles <= diskMinTotalInodes {
-			return errDiskFull
-		}
-	}
-
 	return nil
 }
 
@@ -198,17 +251,6 @@ func checkDiskMinFree(di disk.Info) error {
 	availableDiskSpace := float64(di.Free) * 0.95
 	if int64(availableDiskSpace) <= diskMinFreeSpace {
 		return errDiskFull
-	}
-
-	// Some filesystems do not implement a way to provide total inodes available, instead inodes
-	// are allocated based on available disk space. For example CephDISK, StoreNext CVDISK, AzureFile driver.
-	// Allow for the available disk to be separately validate and we will validate inodes only if
-	// total inodes are provided by the underlying filesystem.
-	if di.Files != 0 && di.FSType != "NFS" {
-		availableFiles := int64(di.Ffree)
-		if availableFiles <= diskMinFreeInodes {
-			return errDiskFull
-		}
 	}
 
 	// Success.
@@ -226,7 +268,7 @@ func checkDiskFree(diskPath string, neededSpace int64) (err error) {
 	}
 
 	var di disk.Info
-	di, err = getDiskInfo(preparePath(diskPath))
+	di, err = getDiskInfo((diskPath))
 	if err != nil {
 		return err
 	}
@@ -248,20 +290,51 @@ func (s *posix) String() string {
 	return s.diskPath
 }
 
-// Init - this is a dummy call.
-func (s *posix) Init() error {
+func (s *posix) LastError() error {
 	return nil
 }
 
-// Close - this is a dummy call.
 func (s *posix) Close() error {
+	close(s.stopUsageCh)
+	s.connected = false
 	return nil
+}
+
+func (s *posix) IsOnline() bool {
+	return s.connected
+}
+
+// DiskInfo is an extended type which returns current
+// disk usage per path.
+type DiskInfo struct {
+	Total    uint64
+	Free     uint64
+	Used     uint64
+	RootDisk bool
 }
 
 // DiskInfo provides current information about disk space usage,
 // total free inodes and underlying filesystem.
-func (s *posix) DiskInfo() (info disk.Info, err error) {
-	return getDiskInfo(preparePath(s.diskPath))
+func (s *posix) DiskInfo() (info DiskInfo, err error) {
+	di, err := getDiskInfo(s.diskPath)
+	if err != nil {
+		return info, err
+	}
+	used := di.Total - di.Free
+	if !s.diskMount {
+		used = atomic.LoadUint64(&s.totalUsed)
+	}
+
+	rootDisk, err := disk.IsRootDisk(s.diskPath)
+	if err != nil {
+		return info, err
+	}
+	return DiskInfo{
+		Total:    di.Total,
+		Free:     di.Free,
+		Used:     used,
+		RootDisk: rootDisk,
+	}, nil
 }
 
 // getVolDir - will convert incoming volume names to
@@ -269,8 +342,8 @@ func (s *posix) DiskInfo() (info disk.Info, err error) {
 // compatible way for all operating systems. If volume is not found
 // an error is generated.
 func (s *posix) getVolDir(volume string) (string, error) {
-	if !isValidVolname(volume) {
-		return "", errInvalidArgument
+	if volume == "" || volume == "." || volume == ".." {
+		return "", errVolumeNotFound
 	}
 	volumeDir := pathJoin(s.diskPath, volume)
 	return volumeDir, nil
@@ -279,21 +352,115 @@ func (s *posix) getVolDir(volume string) (string, error) {
 // checkDiskFound - validates if disk is available,
 // returns errDiskNotFound if not found.
 func (s *posix) checkDiskFound() (err error) {
-	_, err = osStat(preparePath(s.diskPath))
+	if !s.IsOnline() {
+		return errDiskNotFound
+	}
+	fi, err := os.Stat(s.diskPath)
 	if err != nil {
-		if os.IsNotExist(err) {
+		switch {
+		case os.IsNotExist(err):
 			return errDiskNotFound
-		} else if isSysErrTooLong(err) {
+		case isSysErrTooLong(err):
 			return errFileNameTooLong
+		case isSysErrIO(err):
+			return errFaultyDisk
+		default:
+			return err
 		}
 	}
-	return err
+	if !os.SameFile(s.diskFileInfo, fi) {
+		s.connected = false
+		return errDiskNotFound
+	}
+	return nil
+}
+
+// diskUsage returns du information for the posix path, in a continuous routine.
+func (s *posix) diskUsage(doneCh chan struct{}) {
+	ticker := time.NewTicker(globalUsageCheckInterval)
+	defer ticker.Stop()
+
+	usageFn := func(ctx context.Context, entry string) error {
+		if globalHTTPServer != nil {
+			// Wait at max 1 minute for an inprogress request
+			// before proceeding to count the usage.
+			waitCount := 60
+			// Any requests in progress, delay the usage.
+			for globalHTTPServer.GetRequestCount() > 0 && waitCount > 0 {
+				waitCount--
+				time.Sleep(1 * time.Second)
+			}
+		}
+
+		select {
+		case <-doneCh:
+			return errWalkAbort
+		case <-s.stopUsageCh:
+			return errWalkAbort
+		default:
+			fi, err := os.Stat(entry)
+			if err != nil {
+				err = osErrToFSFileErr(err)
+				return err
+			}
+			atomic.AddUint64(&s.totalUsed, uint64(fi.Size()))
+			return nil
+		}
+	}
+
+	// Return this routine upon errWalkAbort, continue for any other error on purpose
+	// so that we can start the routine freshly in another 12 hours.
+	if err := getDiskUsage(context.Background(), s.diskPath, usageFn); err == errWalkAbort {
+		return
+	}
+
+	for {
+		select {
+		case <-s.stopUsageCh:
+			return
+		case <-doneCh:
+			return
+		case <-time.After(globalUsageCheckInterval):
+			var usage uint64
+			usageFn = func(ctx context.Context, entry string) error {
+				if globalHTTPServer != nil {
+					// Wait at max 1 minute for an inprogress request
+					// before proceeding to count the usage.
+					waitCount := 60
+					// Any requests in progress, delay the usage.
+					for globalHTTPServer.GetRequestCount() > 0 && waitCount > 0 {
+						waitCount--
+						time.Sleep(1 * time.Second)
+					}
+				}
+
+				select {
+				case <-s.stopUsageCh:
+					return errWalkAbort
+				default:
+					fi, err := os.Stat(entry)
+					if err != nil {
+						err = osErrToFSFileErr(err)
+						return err
+					}
+					usage = usage + uint64(fi.Size())
+					return nil
+				}
+			}
+
+			if err := getDiskUsage(context.Background(), s.diskPath, usageFn); err != nil {
+				continue
+			}
+
+			atomic.StoreUint64(&s.totalUsed, usage)
+		}
+	}
 }
 
 // Make a volume entry.
 func (s *posix) MakeVol(volume string) (err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -306,28 +473,37 @@ func (s *posix) MakeVol(volume string) (err error) {
 		return err
 	}
 
+	if !isValidVolname(volume) {
+		return errInvalidArgument
+	}
+
 	volumeDir, err := s.getVolDir(volume)
 	if err != nil {
 		return err
 	}
-	// Make a volume entry, with mode 0777 mkdir honors system umask.
-	err = os.Mkdir(preparePath(volumeDir), 0777)
-	if err != nil {
-		if os.IsExist(err) {
-			return errVolumeExists
-		} else if os.IsPermission(err) {
+
+	if _, err := os.Stat(volumeDir); err != nil {
+		// Volume does not exist we proceed to create.
+		if os.IsNotExist(err) {
+			// Make a volume entry, with mode 0777 mkdir honors system umask.
+			err = os.MkdirAll(volumeDir, 0777)
+		}
+		if os.IsPermission(err) {
 			return errDiskAccessDenied
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
 		}
 		return err
 	}
-	// Success
-	return nil
+
+	// Stat succeeds we return errVolumeExists.
+	return errVolumeExists
 }
 
 // ListVols - list volumes.
 func (s *posix) ListVols() (volsInfo []VolInfo, err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -340,8 +516,11 @@ func (s *posix) ListVols() (volsInfo []VolInfo, err error) {
 		return nil, err
 	}
 
-	volsInfo, err = listVols(preparePath(s.diskPath))
+	volsInfo, err = listVols(s.diskPath)
 	if err != nil {
+		if isSysErrIO(err) {
+			return nil, errFaultyDisk
+		}
 		return nil, err
 	}
 	for i, vol := range volsInfo {
@@ -370,17 +549,19 @@ func listVols(dirPath string) ([]VolInfo, error) {
 			continue
 		}
 		var fi os.FileInfo
-		fi, err = osStat(preparePath(pathJoin(dirPath, entry)))
+		fi, err = os.Stat(pathJoin(dirPath, entry))
 		if err != nil {
 			// If the file does not exist, skip the entry.
 			if os.IsNotExist(err) {
 				continue
+			} else if isSysErrIO(err) {
+				return nil, errFaultyDisk
 			}
 			return nil, err
 		}
 		volsInfo = append(volsInfo, VolInfo{
 			Name: fi.Name(),
-			// As osStat() doesn't carry other than ModTime(), use
+			// As os.Stat() doesn't carry other than ModTime(), use
 			// ModTime() as CreatedTime.
 			Created: fi.ModTime(),
 		})
@@ -391,7 +572,7 @@ func listVols(dirPath string) ([]VolInfo, error) {
 // StatVol - get volume info.
 func (s *posix) StatVol(volume string) (volInfo VolInfo, err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -411,14 +592,16 @@ func (s *posix) StatVol(volume string) (volInfo VolInfo, err error) {
 	}
 	// Stat a volume entry.
 	var st os.FileInfo
-	st, err = osStat(preparePath(volumeDir))
+	st, err = os.Stat(volumeDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return VolInfo{}, errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return VolInfo{}, errFaultyDisk
 		}
 		return VolInfo{}, err
 	}
-	// As osStat() doesn't carry other than ModTime(), use ModTime()
+	// As os.Stat() doesn't carry other than ModTime(), use ModTime()
 	// as CreatedTime.
 	createdTime := st.ModTime()
 	return VolInfo{
@@ -430,7 +613,7 @@ func (s *posix) StatVol(volume string) (volInfo VolInfo, err error) {
 // DeleteVol - delete a volume.
 func (s *posix) DeleteVol(volume string) (err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -448,23 +631,29 @@ func (s *posix) DeleteVol(volume string) (err error) {
 	if err != nil {
 		return err
 	}
-	err = os.Remove(preparePath(volumeDir))
+	err = os.Remove((volumeDir))
 	if err != nil {
-		if os.IsNotExist(err) {
+		switch {
+		case os.IsNotExist(err):
 			return errVolumeNotFound
-		} else if isSysErrNotEmpty(err) {
+		case isSysErrNotEmpty(err):
 			return errVolumeNotEmpty
+		case os.IsPermission(err):
+			return errDiskAccessDenied
+		case isSysErrIO(err):
+			return errFaultyDisk
+		default:
+			return err
 		}
-		return err
 	}
 	return nil
 }
 
 // ListDir - return all the entries at the given directory path.
 // If an entry is a directory it will be returned with a trailing "/".
-func (s *posix) ListDir(volume, dirPath string) (entries []string, err error) {
+func (s *posix) ListDir(volume, dirPath string, count int) (entries []string, err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -483,14 +672,21 @@ func (s *posix) ListDir(volume, dirPath string) (entries []string, err error) {
 		return nil, err
 	}
 	// Stat a volume entry.
-	_, err = osStat(preparePath(volumeDir))
+	_, err = os.Stat((volumeDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return nil, errFaultyDisk
 		}
 		return nil, err
 	}
-	return readDir(pathJoin(volumeDir, dirPath))
+
+	dirPath = pathJoin(volumeDir, dirPath)
+	if count > 0 {
+		return readDirN(dirPath, count)
+	}
+	return readDir(dirPath)
 }
 
 // ReadAll reads from r until an error or EOF and returns the data it read.
@@ -501,7 +697,7 @@ func (s *posix) ListDir(volume, dirPath string) (entries []string, err error) {
 // not use this on large files as it would cause server to crash.
 func (s *posix) ReadAll(volume, path string) (buf []byte, err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -519,22 +715,24 @@ func (s *posix) ReadAll(volume, path string) (buf []byte, err error) {
 		return nil, err
 	}
 	// Stat a volume entry.
-	_, err = osStat(preparePath(volumeDir))
+	_, err = os.Stat((volumeDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return nil, errFaultyDisk
 		}
 		return nil, err
 	}
 
 	// Validate file path length, before reading.
 	filePath := pathJoin(volumeDir, path)
-	if err = checkPathLength(preparePath(filePath)); err != nil {
+	if err = checkPathLength((filePath)); err != nil {
 		return nil, err
 	}
 
 	// Open the file for reading.
-	buf, err = ioutil.ReadFile(preparePath(filePath))
+	buf, err = ioutil.ReadFile((filePath))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, errFileNotFound
@@ -551,6 +749,8 @@ func (s *posix) ReadAll(volume, path string) (buf []byte, err error) {
 				}
 			}
 			return nil, pathErr
+		} else if isSysErrIO(err) {
+			return nil, errFaultyDisk
 		}
 		return nil, err
 	}
@@ -563,33 +763,25 @@ func (s *posix) ReadAll(volume, path string) (buf []byte, err error) {
 // for io.EOF.
 //
 // If an EOF happens after reading some but not all the bytes,
-// ReadFull returns ErrUnexpectedEOF.
+// ReadFile returns ErrUnexpectedEOF.
+//
+// If the BitrotVerifier is not nil or not verified ReadFile
+// tries to verify whether the disk has bitrot.
 //
 // Additionally ReadFile also starts reading from an offset. ReadFile
 // semantics are same as io.ReadFull.
-func (s *posix) ReadFile(volume, path string, offset int64, buf []byte) (n int64, err error) {
-
-	return s.ReadFileWithVerify(volume, path, offset, buf, "", "")
-}
-
-// ReadFileWithVerify is the same as ReadFile but with hashsum
-// verification: the operation will fail if the hash verification
-// fails.
-//
-// The `expectedHash` is the expected hex-encoded hash string for
-// verification. With an empty expected hash string, hash verification
-// is skipped. An empty HashAlgo defaults to `blake2b`.
-//
-// The function takes care to minimize the number of disk read
-// operations.
-func (s *posix) ReadFileWithVerify(volume, path string, offset int64, buf []byte,
-	algo HashAlgo, expectedHash string) (n int64, err error) {
-
+func (s *posix) ReadFile(volume, path string, offset int64, buffer []byte, verifier *BitrotVerifier) (int64, error) {
+	var n int
+	var err error
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
+
+	if offset < 0 {
+		return 0, errInvalidArgument
+	}
 
 	if atomic.LoadInt32(&s.ioErrCount) > maxAllowedIOError {
 		return 0, errFaultyDisk
@@ -604,31 +796,37 @@ func (s *posix) ReadFileWithVerify(volume, path string, offset int64, buf []byte
 		return 0, err
 	}
 	// Stat a volume entry.
-	_, err = osStat(preparePath(volumeDir))
+	_, err = os.Stat((volumeDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return 0, errFaultyDisk
 		}
 		return 0, err
 	}
 
 	// Validate effective path length before reading.
 	filePath := pathJoin(volumeDir, path)
-	if err = checkPathLength(preparePath(filePath)); err != nil {
+	if err = checkPathLength((filePath)); err != nil {
 		return 0, err
 	}
 
 	// Open the file for reading.
-	file, err := os.Open(preparePath(filePath))
+	file, err := os.Open((filePath))
 	if err != nil {
-		if os.IsNotExist(err) {
+		switch {
+		case os.IsNotExist(err):
 			return 0, errFileNotFound
-		} else if os.IsPermission(err) {
+		case os.IsPermission(err):
 			return 0, errFileAccessDenied
-		} else if isSysErrNotDir(err) {
+		case isSysErrNotDir(err):
 			return 0, errFileAccessDenied
+		case isSysErrIO(err):
+			return 0, errFaultyDisk
+		default:
+			return 0, err
 		}
-		return 0, err
 	}
 
 	// Close the file descriptor.
@@ -645,68 +843,41 @@ func (s *posix) ReadFileWithVerify(volume, path string, offset int64, buf []byte
 		return 0, errIsNotRegular
 	}
 
-	// If expected hash string is empty hash verification is
-	// skipped.
-	needToHash := expectedHash != ""
-	var hasher hash.Hash
-
-	if needToHash {
-		// If the hashing algo is invalid, return an error.
-		if !isValidHashAlgo(algo) {
-			return 0, errBitrotHashAlgoInvalid
-		}
-
-		// Compute hash of object from start to the byte at
-		// (offset - 1), and as a result of this read, seek to
-		// `offset`.
-		hasher = newHash(algo)
-		if offset > 0 {
-			_, err = io.CopyN(hasher, file, offset)
-			if err != nil {
-				return 0, err
-			}
-		}
-	} else {
-		// Seek to requested offset.
-		_, err = file.Seek(offset, os.SEEK_SET)
-		if err != nil {
-			return 0, err
-		}
+	if verifier == nil {
+		n, err = file.ReadAt(buffer, offset)
+		return int64(n), err
 	}
 
-	// Read until buffer is full.
-	m, err := io.ReadFull(file, buf)
-	if err == io.EOF {
+	bufp := s.pool.Get().(*[]byte)
+	defer s.pool.Put(bufp)
+
+	h := verifier.algorithm.New()
+	if _, err = io.CopyBuffer(h, io.LimitReader(file, offset), *bufp); err != nil {
 		return 0, err
 	}
 
-	if needToHash {
-		// Continue computing hash with buf.
-		_, err = hasher.Write(buf)
-		if err != nil {
-			return 0, err
-		}
-
-		// Continue computing hash until end of file.
-		_, err = io.Copy(hasher, file)
-		if err != nil {
-			return 0, err
-		}
-
-		// Verify the computed hash.
-		computedHash := hex.EncodeToString(hasher.Sum(nil))
-		if computedHash != expectedHash {
-			return 0, hashMismatchError{expectedHash, computedHash}
-		}
+	if n, err = io.ReadFull(file, buffer); err != nil {
+		return int64(n), err
 	}
 
-	// Success.
-	return int64(m), err
+	if _, err = h.Write(buffer); err != nil {
+		return 0, err
+	}
+
+	if _, err = io.CopyBuffer(h, file, *bufp); err != nil {
+		return 0, err
+	}
+
+	if !bytes.Equal(h.Sum(nil), verifier.sum) {
+		return 0, hashMismatchError{hex.EncodeToString(verifier.sum), hex.EncodeToString(h.Sum(nil))}
+	}
+
+	return int64(len(buffer)), nil
 }
 
-func (s *posix) createFile(volume, path string) (f *os.File, err error) {
+func (s *posix) openFile(volume, path string, mode int) (f *os.File, err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -724,22 +895,24 @@ func (s *posix) createFile(volume, path string) (f *os.File, err error) {
 		return nil, err
 	}
 	// Stat a volume entry.
-	_, err = osStat(preparePath(volumeDir))
+	_, err = os.Stat((volumeDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return nil, errFaultyDisk
 		}
 		return nil, err
 	}
 
 	filePath := pathJoin(volumeDir, path)
-	if err = checkPathLength(preparePath(filePath)); err != nil {
+	if err = checkPathLength((filePath)); err != nil {
 		return nil, err
 	}
 
 	// Verify if the file already exists and is not of regular type.
 	var st os.FileInfo
-	if st, err = osStat(preparePath(filePath)); err == nil {
+	if st, err = os.Stat(filePath); err == nil {
 		if !st.Mode().IsRegular() {
 			return nil, errIsNotRegular
 		}
@@ -747,39 +920,115 @@ func (s *posix) createFile(volume, path string) (f *os.File, err error) {
 		// Create top level directories if they don't exist.
 		// with mode 0777 mkdir honors system umask.
 		if err = mkdirAll(slashpath.Dir(filePath), 0777); err != nil {
-			// File path cannot be verified since one of the parents is a file.
-			if isSysErrNotDir(err) {
-				return nil, errFileAccessDenied
-			} else if isSysErrPathNotFound(err) {
-				// Add specific case for windows.
-				return nil, errFileAccessDenied
-			}
 			return nil, err
 		}
 	}
 
-	w, err := os.OpenFile(preparePath(filePath), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
+	w, err := os.OpenFile(filePath, mode, 0666)
 	if err != nil {
 		// File path cannot be verified since one of the parents is a file.
-		if isSysErrNotDir(err) {
+		switch {
+		case isSysErrNotDir(err):
 			return nil, errFileAccessDenied
+		case os.IsPermission(err):
+			return nil, errFileAccessDenied
+		case isSysErrIO(err):
+			return nil, errFaultyDisk
+		default:
+			return nil, err
 		}
-		return nil, err
 	}
 
 	return w, nil
 }
 
-// PrepareFile - run prior actions before creating a new file for optimization purposes
-// Currently we use fallocate when available to avoid disk fragmentation as much as possible
-func (s *posix) PrepareFile(volume, path string, fileSize int64) (err error) {
-	// It doesn't make sense to create a negative-sized file
-	if fileSize <= 0 {
+// ReadFileStream - Returns the read stream of the file.
+func (s *posix) ReadFileStream(volume, path string, offset, length int64) (io.ReadCloser, error) {
+	var err error
+	defer func() {
+		if err == errFaultyDisk {
+			atomic.AddInt32(&s.ioErrCount, 1)
+		}
+	}()
+
+	if offset < 0 {
+		return nil, errInvalidArgument
+	}
+
+	if atomic.LoadInt32(&s.ioErrCount) > maxAllowedIOError {
+		return nil, errFaultyDisk
+	}
+
+	if err = s.checkDiskFound(); err != nil {
+		return nil, err
+	}
+
+	volumeDir, err := s.getVolDir(volume)
+	if err != nil {
+		return nil, err
+	}
+	// Stat a volume entry.
+	_, err = os.Stat((volumeDir))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return nil, errFaultyDisk
+		}
+		return nil, err
+	}
+
+	// Validate effective path length before reading.
+	filePath := pathJoin(volumeDir, path)
+	if err = checkPathLength((filePath)); err != nil {
+		return nil, err
+	}
+
+	// Open the file for reading.
+	file, err := os.Open((filePath))
+	if err != nil {
+		switch {
+		case os.IsNotExist(err):
+			return nil, errFileNotFound
+		case os.IsPermission(err):
+			return nil, errFileAccessDenied
+		case isSysErrNotDir(err):
+			return nil, errFileAccessDenied
+		case isSysErrIO(err):
+			return nil, errFaultyDisk
+		default:
+			return nil, err
+		}
+	}
+
+	st, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	// Verify it is a regular file, otherwise subsequent Seek is
+	// undefined.
+	if !st.Mode().IsRegular() {
+		return nil, errIsNotRegular
+	}
+
+	if _, err = file.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{Reader: io.LimitReader(file, length), Closer: file}, nil
+}
+
+// CreateFile - creates the file.
+func (s *posix) CreateFile(volume, path string, fileSize int64, r io.Reader) (err error) {
+	if fileSize < 0 {
 		return errInvalidArgument
 	}
 
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -790,20 +1039,26 @@ func (s *posix) PrepareFile(volume, path string, fileSize int64) (err error) {
 
 	// Validate if disk is indeed free.
 	if err = checkDiskFree(s.diskPath, fileSize); err != nil {
+		if isSysErrIO(err) {
+			return errFaultyDisk
+		}
 		return err
 	}
 
-	// Create file if not found
-	w, err := s.createFile(volume, path)
+	// Create file if not found. Note that it is created with os.O_EXCL flag as the file
+	// always is supposed to be created in the tmp directory with a unique file name.
+	w, err := s.openFile(volume, path, os.O_CREATE|os.O_APPEND|os.O_WRONLY|os.O_EXCL)
 	if err != nil {
 		return err
 	}
 
-	// Close upon return.
 	defer w.Close()
 
-	// Allocate needed disk space to append data
-	e := Fallocate(int(w.Fd()), 0, fileSize)
+	var e error
+	if fileSize > 0 {
+		// Allocate needed disk space to append data
+		e = Fallocate(int(w.Fd()), 0, fileSize)
+	}
 
 	// Ignore errors when Fallocate is not supported in the current system
 	if e != nil && !isSysErrNoSys(e) && !isSysErrOpNotSupported(e) {
@@ -811,7 +1066,7 @@ func (s *posix) PrepareFile(volume, path string, fileSize int64) (err error) {
 		case isSysErrNoSpace(e):
 			err = errDiskFull
 		case isSysErrIO(e):
-			err = e
+			err = errFaultyDisk
 		default:
 			// For errors: EBADF, EINTR, EINVAL, ENODEV, EPERM, ESPIPE  and ETXTBSY
 			// Appending was failed anyway, returns unexpected error
@@ -819,14 +1074,26 @@ func (s *posix) PrepareFile(volume, path string, fileSize int64) (err error) {
 		}
 		return err
 	}
+
+	bufp := s.pool.Get().(*[]byte)
+	defer s.pool.Put(bufp)
+
+	n, err := io.CopyBuffer(w, r, *bufp)
+	if err != nil {
+		return err
+	}
+	if n < fileSize {
+		return errLessData
+	}
+	if n > fileSize {
+		return errMoreData
+	}
 	return nil
 }
 
-// AppendFile - append a byte array at path, if file doesn't exist at
-// path this call explicitly creates it.
-func (s *posix) AppendFile(volume, path string, buf []byte) (err error) {
+func (s *posix) WriteAll(volume, path string, buf []byte) (err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -835,29 +1102,56 @@ func (s *posix) AppendFile(volume, path string, buf []byte) (err error) {
 		return errFaultyDisk
 	}
 
-	// Create file if not found
-	w, err := s.createFile(volume, path)
+	// Create file if not found. Note that it is created with os.O_EXCL flag as the file
+	// always is supposed to be created in the tmp directory with a unique file name.
+	w, err := s.openFile(volume, path, os.O_CREATE|os.O_SYNC|os.O_WRONLY|os.O_EXCL)
 	if err != nil {
 		return err
 	}
 
-	// Close upon return.
-	defer w.Close()
+	if _, err = w.Write(buf); err != nil {
+		return err
+	}
 
-	bufp := s.pool.Get().(*[]byte)
+	return w.Close()
+}
 
-	// Reuse buffer.
-	defer s.pool.Put(bufp)
+// AppendFile - append a byte array at path, if file doesn't exist at
+// path this call explicitly creates it.
+func (s *posix) AppendFile(volume, path string, buf []byte) (err error) {
+	defer func() {
+		if err == errFaultyDisk {
+			atomic.AddInt32(&s.ioErrCount, 1)
+		}
+	}()
 
-	// Return io.Copy
-	_, err = io.CopyBuffer(w, bytes.NewReader(buf), *bufp)
-	return err
+	if atomic.LoadInt32(&s.ioErrCount) > maxAllowedIOError {
+		return errFaultyDisk
+	}
+
+	var w *os.File
+	// Create file if not found, additionally also enables synchronous
+	// operation if asked by the user.
+	if s.driveSync {
+		w, err = s.openFile(volume, path, os.O_CREATE|os.O_SYNC|os.O_APPEND|os.O_WRONLY)
+	} else {
+		w, err = s.openFile(volume, path, os.O_CREATE|os.O_APPEND|os.O_WRONLY)
+	}
+	if err != nil {
+		return err
+	}
+
+	if _, err = w.Write(buf); err != nil {
+		return err
+	}
+
+	return w.Close()
 }
 
 // StatFile - get file info.
 func (s *posix) StatFile(volume, path string) (file FileInfo, err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -875,7 +1169,7 @@ func (s *posix) StatFile(volume, path string) (file FileInfo, err error) {
 		return FileInfo{}, err
 	}
 	// Stat a volume entry.
-	_, err = osStat(preparePath(volumeDir))
+	_, err = os.Stat((volumeDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return FileInfo{}, errVolumeNotFound
@@ -884,23 +1178,24 @@ func (s *posix) StatFile(volume, path string) (file FileInfo, err error) {
 	}
 
 	filePath := slashpath.Join(volumeDir, path)
-	if err = checkPathLength(preparePath(filePath)); err != nil {
+	if err = checkPathLength((filePath)); err != nil {
 		return FileInfo{}, err
 	}
-	st, err := osStat(preparePath(filePath))
+	st, err := os.Stat((filePath))
 	if err != nil {
-		// File is really not found.
-		if os.IsNotExist(err) {
+		switch {
+		case os.IsNotExist(err):
+			// File is really not found.
 			return FileInfo{}, errFileNotFound
-		}
-
-		// File path cannot be verified since one of the parents is a file.
-		if isSysErrNotDir(err) {
+		case isSysErrIO(err):
+			return FileInfo{}, errFaultyDisk
+		case isSysErrNotDir(err):
+			// File path cannot be verified since one of the parents is a file.
 			return FileInfo{}, errFileNotFound
+		default:
+			// Return all errors here.
+			return FileInfo{}, err
 		}
-
-		// Return all errors here.
-		return FileInfo{}, err
 	}
 	// If its a directory its not a regular file.
 	if st.Mode().IsDir() {
@@ -915,45 +1210,48 @@ func (s *posix) StatFile(volume, path string) (file FileInfo, err error) {
 	}, nil
 }
 
-// deleteFile - delete file path if its empty.
+// deleteFile deletes a file path if its empty. If it's successfully deleted,
+// it will recursively move up the tree, deleting empty parent directories
+// until it finds one with files in it. Returns nil for a non-empty directory.
 func deleteFile(basePath, deletePath string) error {
 	if basePath == deletePath {
 		return nil
 	}
-	// Verify if the path exists.
-	pathSt, err := osStat(preparePath(deletePath))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return errFileNotFound
-		} else if os.IsPermission(err) {
-			return errFileAccessDenied
-		}
-		return err
-	}
-	if pathSt.IsDir() && !isDirEmpty(deletePath) {
-		// Verify if directory is empty.
-		return nil
-	}
+
 	// Attempt to remove path.
-	if err := os.Remove(preparePath(deletePath)); err != nil {
-		if os.IsNotExist(err) {
+	if err := os.Remove((deletePath)); err != nil {
+		switch {
+		case isSysErrNotEmpty(err):
+			// Ignore errors if the directory is not empty. The server relies on
+			// this functionality, and sometimes uses recursion that should not
+			// error on parent directories.
+			return nil
+		case os.IsNotExist(err):
 			return errFileNotFound
-		} else if os.IsPermission(err) {
+		case os.IsPermission(err):
 			return errFileAccessDenied
+		case isSysErrIO(err):
+			return errFaultyDisk
+		default:
+			return err
 		}
-		return err
 	}
-	// Recursively go down the next path and delete again.
-	if err := deleteFile(basePath, slashpath.Dir(deletePath)); err != nil {
-		return err
-	}
+
+	// Trailing slash is removed when found to ensure
+	// slashpath.Dir() to work as intended.
+	deletePath = strings.TrimSuffix(deletePath, slashSeparator)
+	deletePath = slashpath.Dir(deletePath)
+
+	// Delete parent directory. Errors for parent directories shouldn't trickle down.
+	deleteFile(basePath, deletePath)
+
 	return nil
 }
 
 // DeleteFile - delete a file at path.
 func (s *posix) DeleteFile(volume, path string) (err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -971,10 +1269,12 @@ func (s *posix) DeleteFile(volume, path string) (err error) {
 		return err
 	}
 	// Stat a volume entry.
-	_, err = osStat(preparePath(volumeDir))
+	_, err = os.Stat((volumeDir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
 		}
 		return err
 	}
@@ -982,7 +1282,7 @@ func (s *posix) DeleteFile(volume, path string) (err error) {
 	// Following code is needed so that we retain "/" suffix if any in
 	// path argument.
 	filePath := pathJoin(volumeDir, path)
-	if err = checkPathLength(preparePath(filePath)); err != nil {
+	if err = checkPathLength((filePath)); err != nil {
 		return err
 	}
 
@@ -993,7 +1293,7 @@ func (s *posix) DeleteFile(volume, path string) (err error) {
 // RenameFile - rename source path to destination path atomically.
 func (s *posix) RenameFile(srcVolume, srcPath, dstVolume, dstPath string) (err error) {
 	defer func() {
-		if err == syscall.EIO {
+		if err == errFaultyDisk {
 			atomic.AddInt32(&s.ioErrCount, 1)
 		}
 	}()
@@ -1015,17 +1315,21 @@ func (s *posix) RenameFile(srcVolume, srcPath, dstVolume, dstPath string) (err e
 		return err
 	}
 	// Stat a volume entry.
-	_, err = osStat(preparePath(srcVolumeDir))
+	_, err = os.Stat(srcVolumeDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
 		}
 		return err
 	}
-	_, err = osStat(preparePath(dstVolumeDir))
+	_, err = os.Stat(dstVolumeDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return errVolumeNotFound
+		} else if isSysErrIO(err) {
+			return errFaultyDisk
 		}
 	}
 
@@ -1036,42 +1340,41 @@ func (s *posix) RenameFile(srcVolume, srcPath, dstVolume, dstPath string) (err e
 		return errFileAccessDenied
 	}
 	srcFilePath := slashpath.Join(srcVolumeDir, srcPath)
-	if err = checkPathLength(preparePath(srcFilePath)); err != nil {
+	if err = checkPathLength(srcFilePath); err != nil {
 		return err
 	}
 	dstFilePath := slashpath.Join(dstVolumeDir, dstPath)
-	if err = checkPathLength(preparePath(dstFilePath)); err != nil {
+	if err = checkPathLength(dstFilePath); err != nil {
 		return err
 	}
 	if srcIsDir {
-		// If source is a directory we expect the destination to be non-existent always.
-		_, err = osStat(preparePath(dstFilePath))
-		if err == nil {
+		// If source is a directory, we expect the destination to be non-existent but we
+		// we still need to allow overwriting an empty directory since it represents
+		// an object empty directory.
+		_, err = os.Stat(dstFilePath)
+		if isSysErrIO(err) {
+			return errFaultyDisk
+		}
+		if err == nil && !isDirEmpty(dstFilePath) {
 			return errFileAccessDenied
 		}
-		if !os.IsNotExist(err) {
+		if err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		// Destination does not exist, hence proceed with the rename.
-	}
-	// Creates all the parent directories, with mode 0777 mkdir honors system umask.
-	if err = mkdirAll(slashpath.Dir(dstFilePath), 0777); err != nil {
-		// File path cannot be verified since one of the parents is a file.
-		if isSysErrNotDir(err) {
-			return errFileAccessDenied
-		} else if isSysErrPathNotFound(err) {
-			// This is a special case should be handled only for
-			// windows, because windows API does not return "not a
-			// directory" error message. Handle this specifically here.
-			return errFileAccessDenied
+		// Empty destination remove it before rename.
+		if isDirEmpty(dstFilePath) {
+			if err = os.Remove(dstFilePath); err != nil {
+				if isSysErrNotEmpty(err) {
+					return errFileAccessDenied
+				}
+				return err
+			}
 		}
-		return err
 	}
-	// Finally attempt a rename.
-	err = os.Rename(preparePath(srcFilePath), preparePath(dstFilePath))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return errFileNotFound
+
+	if err = renameAll(srcFilePath, dstFilePath); err != nil {
+		if isSysErrIO(err) {
+			return errFaultyDisk
 		}
 		return err
 	}

@@ -27,17 +27,13 @@ var errUnexpected = errors.New("Unexpected error, please report this issue at ht
 // errCorruptedFormat - corrupted backend format.
 var errCorruptedFormat = errors.New("corrupted backend format, please join https://slack.minio.io for assistance")
 
-// errFormatNotSupported - returned when older minio tries to parse metadata
-// created by newer minio.
-var errFormatNotSupported = errors.New("format not supported")
-
 // errUnformattedDisk - unformatted disk found.
 var errUnformattedDisk = errors.New("unformatted disk found")
 
 // errDiskFull - cannot create volume or files when disk is full.
 var errDiskFull = errors.New("disk path full")
 
-// errDiskNotFount - cannot find the underlying configured disk anymore.
+// errDiskNotFound - cannot find the underlying configured disk anymore.
 var errDiskNotFound = errors.New("disk not found")
 
 // errFaultyRemoteDisk - remote disk is faulty.
@@ -70,12 +66,27 @@ var errVolumeNotEmpty = errors.New("volume is not empty")
 // errVolumeAccessDenied - cannot access volume, insufficient permissions.
 var errVolumeAccessDenied = errors.New("volume access denied")
 
-// errVolumeAccessDenied - cannot access file, insufficient permissions.
+// errFileAccessDenied - cannot access file, insufficient permissions.
 var errFileAccessDenied = errors.New("file access denied")
+
+// errFileParentIsFile - cannot have overlapping objects, parent is already a file.
+var errFileParentIsFile = errors.New("parent is a file")
 
 // errBitrotHashAlgoInvalid - the algo for bit-rot hash
 // verification is empty or invalid.
 var errBitrotHashAlgoInvalid = errors.New("bit-rot hash algorithm is invalid")
+
+// errCrossDeviceLink - rename across devices not allowed.
+var errCrossDeviceLink = errors.New("Rename across devices not allowed, please fix your backend configuration")
+
+// errMinDiskSize - cannot create volume or files when disk size is less than threshold.
+var errMinDiskSize = errors.New("The disk size is less than the minimum threshold")
+
+// errLessData - returned when less data available than what was requested.
+var errLessData = errors.New("less data available than what was requested")
+
+// errMoreData = returned when more data was sent by the caller than what it was supposed to.
+var errMoreData = errors.New("more data was sent than what was advertised")
 
 // hashMisMatchError - represents a bit-rot hash verification failure
 // error.
@@ -90,3 +101,12 @@ func (h hashMismatchError) Error() string {
 		"Bitrot verification mismatch - expected %v, received %v",
 		h.expected, h.computed)
 }
+
+// Collection of basic errors.
+var baseErrs = []error{
+	errDiskNotFound,
+	errFaultyDisk,
+	errFaultyRemoteDisk,
+}
+
+var baseIgnoredErrs = baseErrs

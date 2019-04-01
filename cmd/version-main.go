@@ -23,7 +23,7 @@ import (
 
 var versionCmd = cli.Command{
 	Name:   "version",
-	Usage:  "Print version.",
+	Usage:  "print version",
 	Action: mainVersion,
 	CustomHelpTemplate: `NAME:
    {{.HelpName}} - {{.Usage}}
@@ -36,7 +36,7 @@ FLAGS:
   {{end}}{{end}}
 EXAMPLES:
    1. Prints server version:
-       $ {{.HelpName}}
+      $ {{.HelpName}}
 `,
 }
 

@@ -17,26 +17,28 @@
 package cmd
 
 import (
+	"context"
+	"encoding/hex"
 	"errors"
 	"hash/crc32"
 	"path"
 	"sync"
 	"time"
 
+	"github.com/minio/minio/cmd/logger"
 	"github.com/tidwall/gjson"
 )
 
 // Returns number of errors that occurred the most (incl. nil) and the
-// corresponding error value. N B when there is more than one error value that
+// corresponding error value. NB When there is more than one error value that
 // occurs maximum number of times, the error value returned depends on how
 // golang's map orders keys. This doesn't affect correctness as long as quorum
 // value is greater than or equal to simple majority, since none of the equally
 // maximal values would occur quorum or more number of times.
 func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) {
 	errorCounts := make(map[error]int)
-	errs = errorsCause(errs)
 	for _, err := range errs {
-		if isErrIgnored(err, ignoredErrs...) {
+		if IsErrIgnored(err, ignoredErrs...) {
 			continue
 		}
 		errorCounts[err]++
@@ -60,37 +62,28 @@ func reduceErrs(errs []error, ignoredErrs []error) (maxCount int, maxErr error) 
 
 // reduceQuorumErrs behaves like reduceErrs by only for returning
 // values of maximally occurring errors validated against a generic
-// quorum number can be read or write quorum depending on usage.
-// additionally a special error is provided as well to be returned
-// in case quorum is not satisfied.
-func reduceQuorumErrs(errs []error, ignoredErrs []error, quorum int, quorumErr error) (maxErr error) {
+// quorum number that can be read or write quorum depending on usage.
+func reduceQuorumErrs(ctx context.Context, errs []error, ignoredErrs []error, quorum int, quorumErr error) error {
 	maxCount, maxErr := reduceErrs(errs, ignoredErrs)
-	if maxErr == nil && maxCount >= quorum {
-		// Success in quorum.
-		return nil
+	if maxCount >= quorum {
+		return maxErr
 	}
-	if maxErr != nil && maxCount >= quorum {
-		// Errors in quorum.
-		return traceError(maxErr, errs...)
-	}
-	// No quorum satisfied.
-	maxErr = traceError(quorumErr, errs...)
-	return
+	return quorumErr
 }
 
 // reduceReadQuorumErrs behaves like reduceErrs but only for returning
 // values of maximally occurring errors validated against readQuorum.
-func reduceReadQuorumErrs(errs []error, ignoredErrs []error, readQuorum int) (maxErr error) {
-	return reduceQuorumErrs(errs, ignoredErrs, readQuorum, errXLReadQuorum)
+func reduceReadQuorumErrs(ctx context.Context, errs []error, ignoredErrs []error, readQuorum int) (maxErr error) {
+	return reduceQuorumErrs(ctx, errs, ignoredErrs, readQuorum, errXLReadQuorum)
 }
 
 // reduceWriteQuorumErrs behaves like reduceErrs but only for returning
 // values of maximally occurring errors validated against writeQuorum.
-func reduceWriteQuorumErrs(errs []error, ignoredErrs []error, writeQuorum int) (maxErr error) {
-	return reduceQuorumErrs(errs, ignoredErrs, writeQuorum, errXLWriteQuorum)
+func reduceWriteQuorumErrs(ctx context.Context, errs []error, ignoredErrs []error, writeQuorum int) (maxErr error) {
+	return reduceQuorumErrs(ctx, errs, ignoredErrs, writeQuorum, errXLWriteQuorum)
 }
 
-// Similar to 'len(slice)' but returns  the actual elements count
+// Similar to 'len(slice)' but returns the actual elements count
 // skipping the unallocated elements.
 func diskCount(disks []StorageAPI) int {
 	diskCount := 0
@@ -103,20 +96,21 @@ func diskCount(disks []StorageAPI) int {
 	return diskCount
 }
 
-// hashOrder - hashes input key to return returns consistent
+// hashOrder - hashes input key to return consistent
 // hashed integer slice. Returned integer order is salted
 // with an input key. This results in consistent order.
 // NOTE: collisions are fine, we are not looking for uniqueness
 // in the slices returned.
 func hashOrder(key string, cardinality int) []int {
-	if cardinality < 0 {
-		// Returns an empty int slice for negative cardinality.
+	if cardinality <= 0 {
+		// Returns an empty int slice for cardinality < 0.
 		return nil
 	}
+
 	nums := make([]int, cardinality)
 	keyCrc := crc32.Checksum([]byte(key), crc32.IEEETable)
 
-	start := int(uint32(keyCrc)%uint32(cardinality)) | 1
+	start := int(keyCrc % uint32(cardinality))
 	for i := 1; i <= cardinality; i++ {
 		nums[i-1] = 1 + ((start + i) % cardinality)
 	}
@@ -149,8 +143,8 @@ func parseXLRelease(xlMetaBuf []byte) string {
 	return gjson.GetBytes(xlMetaBuf, "minio.release").String()
 }
 
-func parseXLErasureInfo(xlMetaBuf []byte) erasureInfo {
-	erasure := erasureInfo{}
+func parseXLErasureInfo(ctx context.Context, xlMetaBuf []byte) (ErasureInfo, error) {
+	erasure := ErasureInfo{}
 	erasureResult := gjson.GetBytes(xlMetaBuf, "erasure")
 	// parse the xlV1Meta.Erasure.Distribution.
 	disResult := erasureResult.Get("distribution").Array()
@@ -161,36 +155,54 @@ func parseXLErasureInfo(xlMetaBuf []byte) erasureInfo {
 	}
 	erasure.Distribution = distribution
 
-	erasure.Algorithm = HashAlgo(erasureResult.Get("algorithm").String())
+	erasure.Algorithm = erasureResult.Get("algorithm").String()
 	erasure.DataBlocks = int(erasureResult.Get("data").Int())
 	erasure.ParityBlocks = int(erasureResult.Get("parity").Int())
 	erasure.BlockSize = erasureResult.Get("blockSize").Int()
 	erasure.Index = int(erasureResult.Get("index").Int())
-	// Pare xlMetaV1.Erasure.Checksum array.
-	checkSumsResult := erasureResult.Get("checksum").Array()
-	checkSums := make([]checkSumInfo, len(checkSumsResult))
-	for i, checkSumResult := range checkSumsResult {
-		checkSum := checkSumInfo{}
-		checkSum.Name = checkSumResult.Get("name").String()
-		checkSum.Algorithm = HashAlgo(checkSumResult.Get("algorithm").String())
-		checkSum.Hash = checkSumResult.Get("hash").String()
-		checkSums[i] = checkSum
-	}
-	erasure.Checksum = checkSums
 
-	return erasure
+	checkSumsResult := erasureResult.Get("checksum").Array()
+
+	// Check for scenario where checksum information missing for some parts.
+	partsResult := gjson.GetBytes(xlMetaBuf, "parts").Array()
+	if len(checkSumsResult) != len(partsResult) {
+		return erasure, errCorruptedFormat
+	}
+
+	// Parse xlMetaV1.Erasure.Checksum array.
+	checkSums := make([]ChecksumInfo, len(checkSumsResult))
+	for i, v := range checkSumsResult {
+		algorithm := BitrotAlgorithmFromString(v.Get("algorithm").String())
+		if !algorithm.Available() {
+			logger.LogIf(ctx, errBitrotHashAlgoInvalid)
+			return erasure, errBitrotHashAlgoInvalid
+		}
+		hash, err := hex.DecodeString(v.Get("hash").String())
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return erasure, err
+		}
+		name := v.Get("name").String()
+		if name == "" {
+			return erasure, errCorruptedFormat
+		}
+		checkSums[i] = ChecksumInfo{Name: name, Algorithm: algorithm, Hash: hash}
+	}
+	erasure.Checksums = checkSums
+	return erasure, nil
 }
 
-func parseXLParts(xlMetaBuf []byte) []objectPartInfo {
+func parseXLParts(xlMetaBuf []byte) []ObjectPartInfo {
 	// Parse the XL Parts.
 	partsResult := gjson.GetBytes(xlMetaBuf, "parts").Array()
-	partInfo := make([]objectPartInfo, len(partsResult))
+	partInfo := make([]ObjectPartInfo, len(partsResult))
 	for i, p := range partsResult {
-		info := objectPartInfo{}
+		info := ObjectPartInfo{}
 		info.Number = int(p.Get("number").Int())
 		info.Name = p.Get("name").String()
 		info.ETag = p.Get("etag").String()
 		info.Size = p.Get("size").Int()
+		info.ActualSize = p.Get("actualSize").Int()
 		partInfo[i] = info
 	}
 	return partInfo
@@ -207,8 +219,7 @@ func parseXLMetaMap(xlMetaBuf []byte) map[string]string {
 }
 
 // Constructs XLMetaV1 using `gjson` lib to retrieve each field.
-func xlMetaV1UnmarshalJSON(xlMetaBuf []byte) (xmv xlMetaV1, e error) {
-	xlMeta := xlMetaV1{}
+func xlMetaV1UnmarshalJSON(ctx context.Context, xlMetaBuf []byte) (xlMeta xlMetaV1, e error) {
 	// obtain version.
 	xlMeta.Version = parseXLVersion(xlMetaBuf)
 	// obtain format.
@@ -216,12 +227,16 @@ func xlMetaV1UnmarshalJSON(xlMetaBuf []byte) (xmv xlMetaV1, e error) {
 	// Parse xlMetaV1.Stat .
 	stat, err := parseXLStat(xlMetaBuf)
 	if err != nil {
-		return xmv, err
+		logger.LogIf(ctx, err)
+		return xlMeta, err
 	}
 
 	xlMeta.Stat = stat
 	// parse the xlV1Meta.Erasure fields.
-	xlMeta.Erasure = parseXLErasureInfo(xlMetaBuf)
+	xlMeta.Erasure, err = parseXLErasureInfo(ctx, xlMetaBuf)
+	if err != nil {
+		return xlMeta, err
+	}
 
 	// Parse the XL Parts.
 	xlMeta.Parts = parseXLParts(xlMetaBuf)
@@ -234,24 +249,28 @@ func xlMetaV1UnmarshalJSON(xlMetaBuf []byte) (xmv xlMetaV1, e error) {
 }
 
 // read xl.json from the given disk, parse and return xlV1MetaV1.Parts.
-func readXLMetaParts(disk StorageAPI, bucket string, object string) ([]objectPartInfo, error) {
+func readXLMetaParts(ctx context.Context, disk StorageAPI, bucket string, object string) ([]ObjectPartInfo, map[string]string, error) {
 	// Reads entire `xl.json`.
 	xlMetaBuf, err := disk.ReadAll(bucket, path.Join(object, xlMetaJSONFile))
 	if err != nil {
-		return nil, traceError(err)
+		logger.LogIf(ctx, err)
+		return nil, nil, err
 	}
+
 	// obtain xlMetaV1{}.Partsusing `github.com/tidwall/gjson`.
 	xlMetaParts := parseXLParts(xlMetaBuf)
+	xlMetaMap := parseXLMetaMap(xlMetaBuf)
 
-	return xlMetaParts, nil
+	return xlMetaParts, xlMetaMap, nil
 }
 
 // read xl.json from the given disk and parse xlV1Meta.Stat and xlV1Meta.Meta using gjson.
-func readXLMetaStat(disk StorageAPI, bucket string, object string) (si statInfo, mp map[string]string, e error) {
+func readXLMetaStat(ctx context.Context, disk StorageAPI, bucket string, object string) (si statInfo, mp map[string]string, e error) {
 	// Reads entire `xl.json`.
 	xlMetaBuf, err := disk.ReadAll(bucket, path.Join(object, xlMetaJSONFile))
 	if err != nil {
-		return si, nil, traceError(err)
+		logger.LogIf(ctx, err)
+		return si, nil, err
 	}
 
 	// obtain version.
@@ -261,9 +280,10 @@ func readXLMetaStat(disk StorageAPI, bucket string, object string) (si statInfo,
 	xlFormat := parseXLFormat(xlMetaBuf)
 
 	// Validate if the xl.json we read is sane, return corrupted format.
-	if !isXLMetaValid(xlVersion, xlFormat) {
+	if !isXLMetaFormatValid(xlVersion, xlFormat) {
 		// For version mismatchs and unrecognized format, return corrupted format.
-		return si, nil, traceError(errCorruptedFormat)
+		logger.LogIf(ctx, errCorruptedFormat)
+		return si, nil, errCorruptedFormat
 	}
 
 	// obtain xlMetaV1{}.Meta using `github.com/tidwall/gjson`.
@@ -272,7 +292,8 @@ func readXLMetaStat(disk StorageAPI, bucket string, object string) (si statInfo,
 	// obtain xlMetaV1{}.Stat using `github.com/tidwall/gjson`.
 	xlStat, err := parseXLStat(xlMetaBuf)
 	if err != nil {
-		return si, nil, traceError(err)
+		logger.LogIf(ctx, err)
+		return si, nil, err
 	}
 
 	// Return structured `xl.json`.
@@ -280,16 +301,25 @@ func readXLMetaStat(disk StorageAPI, bucket string, object string) (si statInfo,
 }
 
 // readXLMeta reads `xl.json` and returns back XL metadata structure.
-func readXLMeta(disk StorageAPI, bucket string, object string) (xlMeta xlMetaV1, err error) {
+func readXLMeta(ctx context.Context, disk StorageAPI, bucket string, object string) (xlMeta xlMetaV1, err error) {
 	// Reads entire `xl.json`.
 	xlMetaBuf, err := disk.ReadAll(bucket, path.Join(object, xlMetaJSONFile))
 	if err != nil {
-		return xlMetaV1{}, traceError(err)
+		if err != errFileNotFound && err != errVolumeNotFound {
+			logger.GetReqInfo(ctx).AppendTags("disk", disk.String())
+			logger.LogIf(ctx, err)
+		}
+		return xlMetaV1{}, err
+	}
+	if len(xlMetaBuf) == 0 {
+		return xlMetaV1{}, errFileNotFound
 	}
 	// obtain xlMetaV1{} using `github.com/tidwall/gjson`.
-	xlMeta, err = xlMetaV1UnmarshalJSON(xlMetaBuf)
+	xlMeta, err = xlMetaV1UnmarshalJSON(ctx, xlMetaBuf)
 	if err != nil {
-		return xlMetaV1{}, traceError(err)
+		logger.GetReqInfo(ctx).AppendTags("disk", disk.String())
+		logger.LogIf(ctx, err)
+		return xlMetaV1{}, err
 	}
 	// Return structured `xl.json`.
 	return xlMeta, nil
@@ -297,7 +327,7 @@ func readXLMeta(disk StorageAPI, bucket string, object string) (xlMeta xlMetaV1,
 
 // Reads all `xl.json` metadata as a xlMetaV1 slice.
 // Returns error slice indicating the failed metadata reads.
-func readAllXLMetadata(disks []StorageAPI, bucket, object string) ([]xlMetaV1, []error) {
+func readAllXLMetadata(ctx context.Context, disks []StorageAPI, bucket, object string) ([]xlMetaV1, []error) {
 	errs := make([]error, len(disks))
 	metadataArray := make([]xlMetaV1, len(disks))
 	var wg = &sync.WaitGroup{}
@@ -312,7 +342,7 @@ func readAllXLMetadata(disks []StorageAPI, bucket, object string) ([]xlMetaV1, [
 		go func(index int, disk StorageAPI) {
 			defer wg.Done()
 			var err error
-			metadataArray[index], err = readXLMeta(disk, bucket, object)
+			metadataArray[index], err = readXLMeta(ctx, disk, bucket, object)
 			if err != nil {
 				errs[index] = err
 				return
@@ -342,7 +372,7 @@ func shufflePartsMetadata(partsMetadata []xlMetaV1, distribution []int) (shuffle
 }
 
 // shuffleDisks - shuffle input disks slice depending on the
-// erasure distribution. return shuffled slice of disks with
+// erasure distribution. Return shuffled slice of disks with
 // their expected distribution.
 func shuffleDisks(disks []StorageAPI, distribution []int) (shuffledDisks []StorageAPI) {
 	if distribution == nil {
@@ -358,10 +388,10 @@ func shuffleDisks(disks []StorageAPI, distribution []int) (shuffledDisks []Stora
 }
 
 // evalDisks - returns a new slice of disks where nil is set if
-// the correspond error in errs slice is not nil
+// the corresponding error in errs slice is not nil
 func evalDisks(disks []StorageAPI, errs []error) []StorageAPI {
 	if len(errs) != len(disks) {
-		errorIf(errors.New("unexpected disks/errors slice length"), "unable to evaluate internal disks")
+		logger.LogIf(context.Background(), errors.New("unexpected disks/errors slice length"))
 		return nil
 	}
 	newDisks := make([]StorageAPI, len(disks))
@@ -375,35 +405,40 @@ func evalDisks(disks []StorageAPI, errs []error) []StorageAPI {
 	return newDisks
 }
 
-// Errors specifically generated by getPartSizeFromIdx function.
+// Errors specifically generated by calculatePartSizeFromIdx function.
 var (
 	errPartSizeZero  = errors.New("Part size cannot be zero")
 	errPartSizeIndex = errors.New("Part index cannot be smaller than 1")
 )
 
-// getPartSizeFromIdx predicts the part size according to its index. It also
-// returns -1 when totalSize is also -1.
-func getPartSizeFromIdx(totalSize int64, partSize int64, partIndex int) (int64, error) {
+// calculatePartSizeFromIdx calculates the part size according to input index.
+// returns error if totalSize is -1, partSize is 0, partIndex is 0.
+func calculatePartSizeFromIdx(ctx context.Context, totalSize int64, partSize int64, partIndex int) (currPartSize int64, err error) {
+	if totalSize < -1 {
+		logger.LogIf(ctx, errInvalidArgument)
+		return 0, errInvalidArgument
+	}
 	if partSize == 0 {
-		return 0, traceError(errPartSizeZero)
+		logger.LogIf(ctx, errPartSizeZero)
+		return 0, errPartSizeZero
 	}
 	if partIndex < 1 {
-		return 0, traceError(errPartSizeIndex)
+		logger.LogIf(ctx, errPartSizeIndex)
+		return 0, errPartSizeIndex
 	}
-	switch totalSize {
-	case -1, 0:
-		return totalSize, nil
+	if totalSize > 0 {
+		// Compute the total count of parts
+		partsCount := totalSize/partSize + 1
+		// Return the part's size
+		switch {
+		case int64(partIndex) < partsCount:
+			currPartSize = partSize
+		case int64(partIndex) == partsCount:
+			// Size of last part
+			currPartSize = totalSize % partSize
+		default:
+			currPartSize = 0
+		}
 	}
-	// Compute the total count of parts
-	partsCount := totalSize/partSize + 1
-	// Return the part's size
-	switch {
-	case int64(partIndex) < partsCount:
-		return partSize, nil
-	case int64(partIndex) == partsCount:
-		// Size of last part
-		return totalSize % partSize, nil
-	default:
-		return 0, nil
-	}
+	return currPartSize, nil
 }

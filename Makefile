@@ -7,68 +7,70 @@ BUILD_LDFLAGS := '$(LDFLAGS)'
 all: build
 
 checks:
-	@echo "Check deps"
+	@echo "Checking dependencies"
 	@(env bash $(PWD)/buildscripts/checkdeps.sh)
-	@echo "Checking project is in GOPATH"
+	@echo "Checking for project in GOPATH"
 	@(env bash $(PWD)/buildscripts/checkgopath.sh)
 
-getdeps: checks
-	@echo "Installing golint" && go get -u github.com/golang/lint/golint
-	@echo "Installing gocyclo" && go get -u github.com/fzipp/gocyclo
-	@echo "Installing deadcode" && go get -u github.com/remyoudompheng/go-misc/deadcode
-	@echo "Installing misspell" && go get -u github.com/client9/misspell/cmd/misspell
-	@echo "Installing ineffassign" && go get -u github.com/gordonklaus/ineffassign
+getdeps:
+	@mkdir -p $(GOPATH)/bin
+	@echo "Installing golint" && which golint || go get -u golang.org/x/lint/golint
+	@echo "Installing staticcheck" && which staticcheck || wget --quiet -O $(GOPATH)/bin/staticcheck https://github.com/dominikh/go-tools/releases/download/2019.1/staticcheck_linux_amd64 && chmod +x $(GOPATH)/bin/staticcheck
+	@echo "Installing misspell" && which misspell || wget --quiet https://github.com/client9/misspell/releases/download/v0.3.4/misspell_0.3.4_linux_64bit.tar.gz && tar xvf misspell_0.3.4_linux_64bit.tar.gz && mv misspell $(GOPATH)/bin/misspell && chmod +x $(GOPATH)/bin/misspell && rm -r misspell_0.3.4_linux_64bit.tar.gz
 
-verifiers: getdeps vet fmt lint cyclo spelling
+crosscompile:
+	@(env bash $(PWD)/buildscripts/cross-compile.sh)
+
+verifiers: getdeps vet fmt lint staticcheck spelling
 
 vet:
 	@echo "Running $@"
-	@go tool vet -atomic -bool -copylocks -nilfunc -printf -shadow -rangeloops -unreachable -unsafeptr -unusedresult cmd
-	@go tool vet -atomic -bool -copylocks -nilfunc -printf -shadow -rangeloops -unreachable -unsafeptr -unusedresult pkg
+	@go vet github.com/minio/minio/...
 
 fmt:
 	@echo "Running $@"
-	@gofmt -d cmd
-	@gofmt -d pkg
+	@gofmt -d cmd/
+	@gofmt -d pkg/
 
 lint:
 	@echo "Running $@"
-	@${GOPATH}/bin/golint -set_exit_status github.com/minio/minio/cmd...
-	@${GOPATH}/bin/golint -set_exit_status github.com/minio/minio/pkg...
+	@${GOPATH}/bin/golint -set_exit_status github.com/minio/minio/cmd/...
+	@${GOPATH}/bin/golint -set_exit_status github.com/minio/minio/pkg/...
 
-ineffassign:
+staticcheck:
 	@echo "Running $@"
-	@${GOPATH}/bin/ineffassign .
-
-cyclo:
-	@echo "Running $@"
-	@${GOPATH}/bin/gocyclo -over 100 cmd
-	@${GOPATH}/bin/gocyclo -over 100 pkg
-
-deadcode:
-	@${GOPATH}/bin/deadcode
+	@${GOPATH}/bin/staticcheck github.com/minio/minio/cmd/...
+	@${GOPATH}/bin/staticcheck github.com/minio/minio/pkg/...
 
 spelling:
-	@${GOPATH}/bin/misspell -error `find cmd/`
-	@${GOPATH}/bin/misspell -error `find pkg/`
-	@${GOPATH}/bin/misspell -error `find docs/`
+	@${GOPATH}/bin/misspell -locale US -error `find cmd/`
+	@${GOPATH}/bin/misspell -locale US -error `find pkg/`
+	@${GOPATH}/bin/misspell -locale US -error `find docs/`
+	@${GOPATH}/bin/misspell -locale US -error `find buildscripts/`
+	@${GOPATH}/bin/misspell -locale US -error `find dockerscripts/`
 
 # Builds minio, runs the verifiers then runs the tests.
 check: test
 test: verifiers build
-	@echo "Running all minio testing"
-	@go test $(GOFLAGS) .
-	@go test $(GOFLAGS) github.com/minio/minio/cmd...
-	@go test $(GOFLAGS) github.com/minio/minio/pkg...
+	@echo "Running unit tests"
+	@CGO_ENABLED=0 go test -tags kqueue ./...
+
+verify: build
+	@echo "Verifying build"
+	@(env bash $(PWD)/buildscripts/verify-build.sh)
 
 coverage: build
 	@echo "Running all coverage for minio"
-	@./buildscripts/go-coverage.sh
+	@(env bash $(PWD)/buildscripts/go-coverage.sh)
 
 # Builds minio locally.
-build:
-	@echo "Building minio to $(PWD)/minio ..."
-	@CGO_ENABLED=0 go build --ldflags $(BUILD_LDFLAGS) -o $(PWD)/minio
+build: checks
+	@echo "Building minio binary to './minio'"
+	@GOFLAGS="" CGO_ENABLED=0 go build -tags kqueue --ldflags $(BUILD_LDFLAGS) -o $(PWD)/minio
+	@GOFLAGS="" CGO_ENABLED=0 go build -tags kqueue --ldflags="-s -w" -o $(PWD)/dockerscripts/healthcheck $(PWD)/dockerscripts/healthcheck.go
+
+docker: build
+	@docker build -t $(TAG) . -f Dockerfile.dev
 
 pkg-add:
 	@echo "Adding new package $(PKG)"
@@ -87,18 +89,14 @@ pkg-list:
 
 # Builds minio and installs it to $GOPATH/bin.
 install: build
-	@echo "Installing minio at $(GOPATH)/bin/minio ..."
-	@cp $(PWD)/minio $(GOPATH)/bin/minio
-	@echo "Check 'minio -h' for help."
-
-release: verifiers
-	@MINIO_RELEASE=RELEASE ./buildscripts/build.sh
-
-experimental: verifiers
-	@MINIO_RELEASE=EXPERIMENTAL ./buildscripts/build.sh
+	@echo "Installing minio binary to '$(GOPATH)/bin/minio'"
+	@mkdir -p $(GOPATH)/bin && cp $(PWD)/minio $(GOPATH)/bin/minio
+	@echo "Installation successful. To learn more, try \"minio --help\"."
 
 clean:
 	@echo "Cleaning up all the generated files"
 	@find . -name '*.test' | xargs rm -fv
-	@rm -rf build
-	@rm -rf release
+	@find . -name '*~' | xargs rm -fv
+	@rm -rvf minio
+	@rm -rvf build
+	@rm -rvf release

@@ -16,16 +16,29 @@
 
 package cmd
 
-import "testing"
+import (
+	"net/http"
+	"os"
+	"testing"
+
+	"github.com/minio/minio/pkg/auth"
+)
 
 func testAuthenticate(authType string, t *testing.T) {
-	testPath, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
-		t.Fatalf("unable initialize config file, %s", err)
+		t.Fatal(err)
 	}
-	defer removeAll(testPath)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
-	serverCred := serverConfig.GetCredential()
+	cred, err := auth.GetNewCredentials()
+	if err != nil {
+		t.Fatalf("Error getting new credentials: %s", err)
+	}
+	globalServerConfig.SetCredential(cred)
 
 	// Define test cases.
 	testCases := []struct {
@@ -33,24 +46,16 @@ func testAuthenticate(authType string, t *testing.T) {
 		secretKey   string
 		expectedErr error
 	}{
-		// Access key too small.
-		{"user", "pass", errInvalidAccessKeyLength},
-		// Access key too long.
-		{"user12345678901234567", "pass", errInvalidAccessKeyLength},
-		// Access key contains unsuppported characters.
-		{"!@#$", "pass", errInvalidAccessKeyLength},
-		// Success when access key contains leading/trailing spaces.
-		{" " + serverCred.AccessKey + " ", serverCred.SecretKey, errInvalidAccessKeyLength},
-		// Secret key too small.
-		{"myuser", "pass", errInvalidSecretKeyLength},
-		// Secret key too long.
-		{"myuser", "pass1234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890", errInvalidSecretKeyLength},
+		// Access key (less than 3 chrs) too small.
+		{"u1", cred.SecretKey, auth.ErrInvalidAccessKeyLength},
+		// Secret key (less than 8 chrs) too small.
+		{cred.AccessKey, "pass", auth.ErrInvalidSecretKeyLength},
 		// Authentication error.
 		{"myuser", "mypassword", errInvalidAccessKeyID},
 		// Authentication error.
-		{serverCred.AccessKey, "mypassword", errAuthentication},
+		{cred.AccessKey, "mypassword", errAuthentication},
 		// Success.
-		{serverCred.AccessKey, serverCred.SecretKey, nil},
+		{cred.AccessKey, cred.SecretKey, nil},
 	}
 
 	// Run tests.
@@ -60,6 +65,8 @@ func testAuthenticate(authType string, t *testing.T) {
 			_, err = authenticateNode(testCase.accessKey, testCase.secretKey)
 		} else if authType == "web" {
 			_, err = authenticateWeb(testCase.accessKey, testCase.secretKey)
+		} else if authType == "url" {
+			_, err = authenticateURL(testCase.accessKey, testCase.secretKey)
 		}
 
 		if testCase.expectedErr != nil {
@@ -83,14 +90,76 @@ func TestAuthenticateWeb(t *testing.T) {
 	testAuthenticate("web", t)
 }
 
-func BenchmarkAuthenticateNode(b *testing.B) {
-	testPath, err := newTestConfig(globalMinioDefaultRegion)
-	if err != nil {
-		b.Fatalf("unable initialize config file, %s", err)
-	}
-	defer removeAll(testPath)
+func TestAuthenticateURL(t *testing.T) {
+	testAuthenticate("url", t)
+}
 
-	creds := serverConfig.GetCredential()
+// Tests web request authenticator.
+func TestWebRequestAuthenticate(t *testing.T) {
+	obj, fsDir, err := prepareFS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
+
+	creds := globalServerConfig.GetCredential()
+	token, err := getTokenString(creds.AccessKey, creds.SecretKey)
+	if err != nil {
+		t.Fatalf("unable get token %s", err)
+	}
+	testCases := []struct {
+		req         *http.Request
+		expectedErr error
+	}{
+		// Set valid authorization header.
+		{
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{token},
+				},
+			},
+			expectedErr: nil,
+		},
+		// No authorization header.
+		{
+			req: &http.Request{
+				Header: http.Header{},
+			},
+			expectedErr: errNoAuthToken,
+		},
+		// Invalid authorization token.
+		{
+			req: &http.Request{
+				Header: http.Header{
+					"Authorization": []string{"invalid-token"},
+				},
+			},
+			expectedErr: errAuthentication,
+		},
+	}
+
+	for i, testCase := range testCases {
+		_, _, gotErr := webRequestAuthenticate(testCase.req)
+		if testCase.expectedErr != gotErr {
+			t.Errorf("Test %d, expected err %s, got %s", i+1, testCase.expectedErr, gotErr)
+		}
+	}
+}
+
+func BenchmarkAuthenticateNode(b *testing.B) {
+	obj, fsDir, err := prepareFS()
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		b.Fatal(err)
+	}
+
+	creds := globalServerConfig.GetCredential()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -99,13 +168,16 @@ func BenchmarkAuthenticateNode(b *testing.B) {
 }
 
 func BenchmarkAuthenticateWeb(b *testing.B) {
-	testPath, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
-		b.Fatalf("unable initialize config file, %s", err)
+		b.Fatal(err)
 	}
-	defer removeAll(testPath)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		b.Fatal(err)
+	}
 
-	creds := serverConfig.GetCredential()
+	creds := globalServerConfig.GetCredential()
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {

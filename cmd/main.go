@@ -1,5 +1,5 @@
 /*
- * Minio Cloud Storage, (C) 2015, 2016, 2017 Minio, Inc.
+ * Minio Cloud Storage, (C) 2015, 2016, 2017, 2018 Minio, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,12 +31,25 @@ import (
 var globalFlags = []cli.Flag{
 	cli.StringFlag{
 		Name:  "config-dir, C",
-		Value: getConfigDir(),
-		Usage: "Path to configuration directory.",
+		Value: defaultConfigDir.Get(),
+		Usage: "[DEPRECATED] Path to legacy configuration directory.",
+	},
+	cli.StringFlag{
+		Name:  "certs-dir, S",
+		Value: defaultCertsDir.Get(),
+		Usage: "Path to certs directory.",
 	},
 	cli.BoolFlag{
 		Name:  "quiet",
 		Usage: "Disable startup information.",
+	},
+	cli.BoolFlag{
+		Name:  "anonymous",
+		Usage: "Hide sensitive information from logging.",
+	},
+	cli.BoolFlag{
+		Name:  "json",
+		Usage: "Output server logs and startup information in json format.",
 	},
 }
 
@@ -98,9 +111,9 @@ func newApp(name string) *cli.App {
 
 	// Register all commands.
 	registerCommand(serverCmd)
-	registerCommand(versionCmd)
-	registerCommand(updateCmd)
 	registerCommand(gatewayCmd)
+	registerCommand(updateCmd)
+	registerCommand(versionCmd)
 
 	// Set up app.
 	cli.HelpFlag = cli.BoolFlag{

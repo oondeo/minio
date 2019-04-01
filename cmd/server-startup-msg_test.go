@@ -20,29 +20,21 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
-
-	humanize "github.com/dustin/go-humanize"
 )
 
 // Tests if we generate storage info.
 func TestStorageInfoMsg(t *testing.T) {
-	infoStorage := StorageInfo{
-		Total: 10 * humanize.GiByte,
-		Free:  2 * humanize.GiByte,
-		Backend: struct {
-			Type         BackendType
-			OnlineDisks  int
-			OfflineDisks int
-			ReadQuorum   int
-			WriteQuorum  int
-		}{Erasure, 7, 1, 4, 5},
-	}
+	infoStorage := StorageInfo{}
+	infoStorage.Backend.Type = BackendErasure
+	infoStorage.Backend.OnlineDisks = 7
+	infoStorage.Backend.OfflineDisks = 1
 
-	if msg := getStorageInfoMsg(infoStorage); !strings.Contains(msg, "2.0 GiB Free, 10 GiB Total") || !strings.Contains(msg, "7 Online, 1 Offline") {
+	if msg := getStorageInfoMsg(infoStorage); !strings.Contains(msg, "7 Online, 1 Offline") {
 		t.Fatal("Unexpected storage info message, found:", msg)
 	}
 }
@@ -121,11 +113,14 @@ func TestStripStandardPorts(t *testing.T) {
 
 // Test printing server common message.
 func TestPrintServerCommonMessage(t *testing.T) {
-	root, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer removeAll(root)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
 	apiEndpoints := []string{"http://127.0.0.1:9000"}
 	printServerCommonMsg(apiEndpoints)
@@ -133,11 +128,14 @@ func TestPrintServerCommonMessage(t *testing.T) {
 
 // Tests print cli access message.
 func TestPrintCLIAccessMsg(t *testing.T) {
-	root, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer removeAll(root)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
 	apiEndpoints := []string{"http://127.0.0.1:9000"}
 	printCLIAccessMsg(apiEndpoints[0], "myminio")
@@ -145,11 +143,14 @@ func TestPrintCLIAccessMsg(t *testing.T) {
 
 // Test print startup message.
 func TestPrintStartupMessage(t *testing.T) {
-	root, err := newTestConfig(globalMinioDefaultRegion)
+	obj, fsDir, err := prepareFS()
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer removeAll(root)
+	defer os.RemoveAll(fsDir)
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatal(err)
+	}
 
 	apiEndpoints := []string{"http://127.0.0.1:9000"}
 	printStartupMessage(apiEndpoints)

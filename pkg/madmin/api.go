@@ -18,12 +18,10 @@ package madmin
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -62,15 +60,14 @@ type AdminClient struct {
 	// Advanced functionality.
 	isTraceEnabled bool
 	traceOutput    io.Writer
-
-	// Random seed.
-	random *rand.Rand
 }
 
 // Global constants.
 const (
 	libraryName    = "madmin-go"
 	libraryVersion = "0.0.1"
+
+	libraryAdminURLPrefix = "/minio/admin"
 )
 
 // User Agent should always following the below style.
@@ -91,18 +88,6 @@ func New(endpoint string, accessKeyID, secretAccessKey string, secure bool) (*Ad
 	return clnt, nil
 }
 
-// redirectHeaders copies all headers when following a redirect URL.
-// This won't be needed anymore from go 1.8 (https://github.com/golang/go/issues/4800)
-func redirectHeaders(req *http.Request, via []*http.Request) error {
-	if len(via) == 0 {
-		return nil
-	}
-	for key, val := range via[0].Header {
-		req.Header[key] = val
-	}
-	return nil
-}
-
 func privateNew(endpoint, accessKeyID, secretAccessKey string, secure bool) (*AdminClient, error) {
 	// construct endpoint.
 	endpointURL, err := getEndpointURL(endpoint, secure)
@@ -120,8 +105,7 @@ func privateNew(endpoint, accessKeyID, secretAccessKey string, secure bool) (*Ad
 		endpointURL: *endpointURL,
 		// Instantiate http client and bucket location cache.
 		httpClient: &http.Client{
-			Transport:     http.DefaultTransport,
-			CheckRedirect: redirectHeaders,
+			Transport: http.DefaultTransport,
 		},
 	}
 
@@ -130,21 +114,17 @@ func privateNew(endpoint, accessKeyID, secretAccessKey string, secure bool) (*Ad
 }
 
 // SetAppInfo - add application details to user agent.
-func (c *AdminClient) SetAppInfo(appName string, appVersion string) {
+func (adm *AdminClient) SetAppInfo(appName string, appVersion string) {
 	// if app name and version is not set, we do not a new user
 	// agent.
 	if appName != "" && appVersion != "" {
-		c.appInfo = struct {
-			appName    string
-			appVersion string
-		}{}
-		c.appInfo.appName = appName
-		c.appInfo.appVersion = appVersion
+		adm.appInfo.appName = appName
+		adm.appInfo.appVersion = appVersion
 	}
 }
 
 // SetCustomTransport - set new custom transport.
-func (c *AdminClient) SetCustomTransport(customHTTPTransport http.RoundTripper) {
+func (adm *AdminClient) SetCustomTransport(customHTTPTransport http.RoundTripper) {
 	// Set this to override default transport
 	// ``http.DefaultTransport``.
 	//
@@ -159,28 +139,28 @@ func (c *AdminClient) SetCustomTransport(customHTTPTransport http.RoundTripper) 
 	//   }
 	//   api.SetTransport(tr)
 	//
-	if c.httpClient != nil {
-		c.httpClient.Transport = customHTTPTransport
+	if adm.httpClient != nil {
+		adm.httpClient.Transport = customHTTPTransport
 	}
 }
 
 // TraceOn - enable HTTP tracing.
-func (c *AdminClient) TraceOn(outputStream io.Writer) {
+func (adm *AdminClient) TraceOn(outputStream io.Writer) {
 	// if outputStream is nil then default to os.Stdout.
 	if outputStream == nil {
 		outputStream = os.Stdout
 	}
 	// Sets a new output stream.
-	c.traceOutput = outputStream
+	adm.traceOutput = outputStream
 
 	// Enable tracing.
-	c.isTraceEnabled = true
+	adm.isTraceEnabled = true
 }
 
 // TraceOff - disable HTTP tracing.
-func (c *AdminClient) TraceOff() {
+func (adm *AdminClient) TraceOff() {
 	// Disable tracing.
-	c.isTraceEnabled = false
+	adm.isTraceEnabled = false
 }
 
 // requestMetadata - is container for all the values to make a
@@ -188,15 +168,12 @@ func (c *AdminClient) TraceOff() {
 type requestData struct {
 	customHeaders http.Header
 	queryValues   url.Values
-
-	contentBody        io.Reader
-	contentLength      int64
-	contentSHA256Bytes []byte
-	contentMD5Bytes    []byte
+	relPath       string // URL path relative to admin API base endpoint
+	content       []byte
 }
 
 // Filter out signature value from Authorization header.
-func (c AdminClient) filterSignature(req *http.Request) {
+func (adm AdminClient) filterSignature(req *http.Request) {
 	/// Signature V4 authorization header.
 
 	// Save the original auth.
@@ -212,19 +189,18 @@ func (c AdminClient) filterSignature(req *http.Request) {
 
 	// Set a temporary redacted auth
 	req.Header.Set("Authorization", newAuth)
-	return
 }
 
 // dumpHTTP - dump HTTP request and response.
-func (c AdminClient) dumpHTTP(req *http.Request, resp *http.Response) error {
+func (adm AdminClient) dumpHTTP(req *http.Request, resp *http.Response) error {
 	// Starts http dump.
-	_, err := fmt.Fprintln(c.traceOutput, "---------START-HTTP---------")
+	_, err := fmt.Fprintln(adm.traceOutput, "---------START-HTTP---------")
 	if err != nil {
 		return err
 	}
 
 	// Filter out Signature field from Authorization header.
-	c.filterSignature(req)
+	adm.filterSignature(req)
 
 	// Only display request header.
 	reqTrace, err := httputil.DumpRequestOut(req, false)
@@ -233,7 +209,7 @@ func (c AdminClient) dumpHTTP(req *http.Request, resp *http.Response) error {
 	}
 
 	// Write request to trace output.
-	_, err = fmt.Fprint(c.traceOutput, string(reqTrace))
+	_, err = fmt.Fprint(adm.traceOutput, string(reqTrace))
 	if err != nil {
 		return err
 	}
@@ -269,24 +245,24 @@ func (c AdminClient) dumpHTTP(req *http.Request, resp *http.Response) error {
 		}
 	}
 	// Write response to trace output.
-	_, err = fmt.Fprint(c.traceOutput, strings.TrimSuffix(string(respTrace), "\r\n"))
+	_, err = fmt.Fprint(adm.traceOutput, strings.TrimSuffix(string(respTrace), "\r\n"))
 	if err != nil {
 		return err
 	}
 
 	// Ends the http dump.
-	_, err = fmt.Fprintln(c.traceOutput, "---------END-HTTP---------")
+	_, err = fmt.Fprintln(adm.traceOutput, "---------END-HTTP---------")
 	return err
 }
 
 // do - execute http request.
-func (c AdminClient) do(req *http.Request) (*http.Response, error) {
+func (adm AdminClient) do(req *http.Request) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 	// Do the request in a loop in case of 307 http is met since golang still doesn't
 	// handle properly this situation (https://github.com/golang/go/issues/7912)
 	for {
-		resp, err = c.httpClient.Do(req)
+		resp, err = adm.httpClient.Do(req)
 		if err != nil {
 			// Handle this specifically for now until future Golang
 			// versions fix this issue properly.
@@ -319,8 +295,8 @@ func (c AdminClient) do(req *http.Request) (*http.Response, error) {
 	}
 
 	// If trace is enabled, dump http request and response.
-	if c.isTraceEnabled {
-		err = c.dumpHTTP(req, resp)
+	if adm.isTraceEnabled {
+		err = adm.dumpHTTP(req, resp)
 		if err != nil {
 			return nil, err
 		}
@@ -338,7 +314,7 @@ var successStatus = []int{
 // executeMethod - instantiates a given method, and retries the
 // request upon any error up to maxRetries attempts in a binomially
 // delayed manner using a standard back off algorithm.
-func (c AdminClient) executeMethod(method string, reqData requestData) (res *http.Response, err error) {
+func (adm AdminClient) executeMethod(method string, reqData requestData) (res *http.Response, err error) {
 
 	// Create a done channel to control 'ListObjects' go routine.
 	doneCh := make(chan struct{}, 1)
@@ -348,13 +324,13 @@ func (c AdminClient) executeMethod(method string, reqData requestData) (res *htt
 
 	// Instantiate a new request.
 	var req *http.Request
-	req, err = c.newRequest(method, reqData)
+	req, err = adm.newRequest(method, reqData)
 	if err != nil {
 		return nil, err
 	}
 
 	// Initiate the request.
-	res, err = c.do(req)
+	res, err = adm.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -383,25 +359,25 @@ func (c AdminClient) executeMethod(method string, reqData requestData) (res *htt
 }
 
 // set User agent.
-func (c AdminClient) setUserAgent(req *http.Request) {
+func (adm AdminClient) setUserAgent(req *http.Request) {
 	req.Header.Set("User-Agent", libraryUserAgent)
-	if c.appInfo.appName != "" && c.appInfo.appVersion != "" {
-		req.Header.Set("User-Agent", libraryUserAgent+" "+c.appInfo.appName+"/"+c.appInfo.appVersion)
+	if adm.appInfo.appName != "" && adm.appInfo.appVersion != "" {
+		req.Header.Set("User-Agent", libraryUserAgent+" "+adm.appInfo.appName+"/"+adm.appInfo.appVersion)
 	}
 }
 
 // newRequest - instantiate a new HTTP request for a given method.
-func (c AdminClient) newRequest(method string, reqData requestData) (req *http.Request, err error) {
+func (adm AdminClient) newRequest(method string, reqData requestData) (req *http.Request, err error) {
 	// If no method is supplied default to 'POST'.
 	if method == "" {
 		method = "POST"
 	}
 
-	// Default all requests to "us-east-1"
-	location := "us-east-1"
+	// Default all requests to ""
+	location := ""
 
 	// Construct a new target URL.
-	targetURL, err := c.makeTargetURL(reqData.queryValues)
+	targetURL, err := adm.makeTargetURL(reqData)
 	if err != nil {
 		return nil, err
 	}
@@ -412,57 +388,31 @@ func (c AdminClient) newRequest(method string, reqData requestData) (req *http.R
 		return nil, err
 	}
 
-	// Set content body if available.
-	if reqData.contentBody != nil {
-		req.Body = ioutil.NopCloser(reqData.contentBody)
-	}
-
-	// Set 'User-Agent' header for the request.
-	c.setUserAgent(req)
-
-	// Set all headers.
+	adm.setUserAgent(req)
 	for k, v := range reqData.customHeaders {
 		req.Header.Set(k, v[0])
 	}
-
-	// set incoming content-length.
-	if reqData.contentLength > 0 {
-		req.ContentLength = reqData.contentLength
+	if length := len(reqData.content); length > 0 {
+		req.ContentLength = int64(length)
 	}
+	req.Header.Set("X-Amz-Content-Sha256", hex.EncodeToString(sum256(reqData.content)))
+	req.Body = ioutil.NopCloser(bytes.NewReader(reqData.content))
 
-	shaHeader := unsignedPayload
-	if !c.secure {
-		if reqData.contentSHA256Bytes == nil {
-			shaHeader = hex.EncodeToString(sum256([]byte{}))
-		} else {
-			shaHeader = hex.EncodeToString(reqData.contentSHA256Bytes)
-		}
-	}
-	req.Header.Set("X-Amz-Content-Sha256", shaHeader)
-
-	// set md5Sum for content protection.
-	if reqData.contentMD5Bytes != nil {
-		req.Header.Set("Content-Md5", base64.StdEncoding.EncodeToString(reqData.contentMD5Bytes))
-	}
-
-	// Add signature version '4' authorization header.
-	req = s3signer.SignV4(*req, c.accessKeyID, c.secretAccessKey, "", location)
-
-	// Return request.
+	req = s3signer.SignV4(*req, adm.accessKeyID, adm.secretAccessKey, "", location)
 	return req, nil
 }
 
 // makeTargetURL make a new target url.
-func (c AdminClient) makeTargetURL(queryValues url.Values) (*url.URL, error) {
+func (adm AdminClient) makeTargetURL(r requestData) (*url.URL, error) {
 
-	host := c.endpointURL.Host
-	scheme := c.endpointURL.Scheme
+	host := adm.endpointURL.Host
+	scheme := adm.endpointURL.Scheme
 
-	urlStr := scheme + "://" + host + "/"
+	urlStr := scheme + "://" + host + libraryAdminURLPrefix + r.relPath
 
 	// If there are any query values, add them to the end.
-	if len(queryValues) > 0 {
-		urlStr = urlStr + "?" + s3utils.QueryEncode(queryValues)
+	if len(r.queryValues) > 0 {
+		urlStr = urlStr + "?" + s3utils.QueryEncode(r.queryValues)
 	}
 	u, err := url.Parse(urlStr)
 	if err != nil {

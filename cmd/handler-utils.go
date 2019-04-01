@@ -17,11 +17,20 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"io"
+	"io/ioutil"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/minio/minio/cmd/logger"
+	"github.com/minio/minio/pkg/auth"
+	"github.com/minio/minio/pkg/handlers"
+	httptracer "github.com/minio/minio/pkg/handlers"
 )
 
 // Parses location constraint from the incoming reader.
@@ -31,14 +40,14 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 	// be created at default region.
 	locationConstraint := createBucketLocationConfiguration{}
 	err := xmlDecoder(r.Body, &locationConstraint, r.ContentLength)
-	if err != nil && err != io.EOF {
-		errorIf(err, "Unable to xml decode location constraint")
+	if err != nil && r.ContentLength != 0 {
+		logger.LogIf(context.Background(), err)
 		// Treat all other failures as XML parsing errors.
 		return "", ErrMalformedXML
 	} // else for both err as nil or io.EOF
 	location = locationConstraint.Location
 	if location == "" {
-		location = serverConfig.GetRegion()
+		location = globalServerConfig.GetRegion()
 	}
 	return location, ErrNone
 }
@@ -46,15 +55,18 @@ func parseLocationConstraint(r *http.Request) (location string, s3Error APIError
 // Validates input location is same as configured region
 // of Minio server.
 func isValidLocation(location string) bool {
-	return serverConfig.GetRegion() == "" || serverConfig.GetRegion() == location
+	return globalServerConfig.GetRegion() == "" || globalServerConfig.GetRegion() == location
 }
 
 // Supported headers that needs to be extracted.
 var supportedHeaders = []string{
 	"content-type",
 	"cache-control",
+	"content-language",
 	"content-encoding",
 	"content-disposition",
+	amzStorageClass,
+	"expires",
 	// Add more supported headers here.
 }
 
@@ -97,36 +109,67 @@ func path2BucketAndObject(path string) (bucket, object string) {
 	return bucket, object
 }
 
-// extractMetadataFromHeader extracts metadata from HTTP header.
-func extractMetadataFromHeader(header http.Header) (map[string]string, error) {
-	if header == nil {
-		return nil, traceError(errInvalidArgument)
+// userMetadataKeyPrefixes contains the prefixes of used-defined metadata keys.
+// All values stored with a key starting with one of the following prefixes
+// must be extracted from the header.
+var userMetadataKeyPrefixes = []string{
+	"X-Amz-Meta-",
+	"X-Minio-Meta-",
+}
+
+// extractMetadata extracts metadata from HTTP header and HTTP queryString.
+func extractMetadata(ctx context.Context, r *http.Request) (metadata map[string]string, err error) {
+	query := r.URL.Query()
+	header := r.Header
+	metadata = make(map[string]string)
+	// Extract all query values.
+	err = extractMetadataFromMap(ctx, query, metadata)
+	if err != nil {
+		return nil, err
 	}
-	metadata := make(map[string]string)
-	// Save standard supported headers.
-	for _, supportedHeader := range supportedHeaders {
-		canonicalHeader := http.CanonicalHeaderKey(supportedHeader)
-		// HTTP headers are case insensitive, look for both canonical
-		// and non canonical entries.
-		if _, ok := header[canonicalHeader]; ok {
-			metadata[supportedHeader] = header.Get(canonicalHeader)
-		} else if _, ok := header[supportedHeader]; ok {
-			metadata[supportedHeader] = header.Get(supportedHeader)
-		}
+
+	// Extract all header values.
+	err = extractMetadataFromMap(ctx, header, metadata)
+	if err != nil {
+		return nil, err
 	}
-	// Go through all other headers for any additional headers that needs to be saved.
-	for key := range header {
-		if key != http.CanonicalHeaderKey(key) {
-			return nil, traceError(errInvalidArgument)
-		}
-		if strings.HasPrefix(key, "X-Amz-Meta-") {
-			metadata[key] = header.Get(key)
-		}
-		if strings.HasPrefix(key, "X-Minio-Meta-") {
-			metadata[key] = header.Get(key)
-		}
+
+	// Set content-type to default value if it is not set.
+	if _, ok := metadata["content-type"]; !ok {
+		metadata["content-type"] = "application/octet-stream"
 	}
+
+	// Success.
 	return metadata, nil
+}
+
+// extractMetadata extracts metadata from map values.
+func extractMetadataFromMap(ctx context.Context, v map[string][]string, m map[string]string) error {
+	if v == nil {
+		logger.LogIf(ctx, errInvalidArgument)
+		return errInvalidArgument
+	}
+	// Save all supported headers.
+	for _, supportedHeader := range supportedHeaders {
+		if value, ok := v[http.CanonicalHeaderKey(supportedHeader)]; ok {
+			m[supportedHeader] = value[0]
+		} else if value, ok := v[supportedHeader]; ok {
+			m[supportedHeader] = value[0]
+		}
+	}
+	for key := range v {
+		for _, prefix := range userMetadataKeyPrefixes {
+			if !strings.HasPrefix(strings.ToLower(key), strings.ToLower(prefix)) {
+				continue
+			}
+			value, ok := v[key]
+			if ok {
+				m[key] = strings.Join(value, ",")
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // The Query string for the redirect URL the client is
@@ -139,15 +182,46 @@ func getRedirectPostRawQuery(objInfo ObjectInfo) string {
 	return redirectValues.Encode()
 }
 
+// Returns access credentials in the request Authorization header.
+func getReqAccessCred(r *http.Request, region string) (cred auth.Credentials) {
+	cred, _, _ = getReqAccessKeyV4(r, region, serviceS3)
+	if cred.AccessKey == "" {
+		cred, _, _ = getReqAccessKeyV2(r)
+	}
+	if cred.AccessKey == "" {
+		claims, owner, _ := webRequestAuthenticate(r)
+		if owner {
+			return globalServerConfig.GetCredential()
+		}
+		cred, _ = globalIAMSys.GetUser(claims.Subject)
+	}
+	return cred
+}
+
 // Extract request params to be sent with event notifiation.
 func extractReqParams(r *http.Request) map[string]string {
 	if r == nil {
 		return nil
 	}
 
+	region := globalServerConfig.GetRegion()
+	cred := getReqAccessCred(r, region)
+
 	// Success.
 	return map[string]string{
-		"sourceIPAddress": r.RemoteAddr,
+		"region":          region,
+		"accessKey":       cred.AccessKey,
+		"sourceIPAddress": handlers.GetSourceIP(r),
+		// Add more fields here.
+	}
+}
+
+// Extract response elements to be sent with event notifiation.
+func extractRespElements(w http.ResponseWriter) map[string]string {
+
+	return map[string]string{
+		"requestId":      w.Header().Get(responseRequestIDKey),
+		"content-length": w.Header().Get("Content-Length"),
 		// Add more fields here.
 	}
 }
@@ -170,12 +244,13 @@ func trimAwsChunkedContentEncoding(contentEnc string) (trimmedContentEnc string)
 }
 
 // Validate form field size for s3 specification requirement.
-func validateFormFieldSize(formValues http.Header) error {
+func validateFormFieldSize(ctx context.Context, formValues http.Header) error {
 	// Iterate over form values
 	for k := range formValues {
 		// Check if value's field exceeds S3 limit
 		if int64(len(formValues.Get(k))) > maxFormFieldSize {
-			return traceError(errSizeUnexpected)
+			logger.LogIf(ctx, errSizeUnexpected)
+			return errSizeUnexpected
 		}
 	}
 
@@ -184,7 +259,7 @@ func validateFormFieldSize(formValues http.Header) error {
 }
 
 // Extract form fields and file data from a HTTP POST Policy
-func extractPostPolicyFormValues(form *multipart.Form) (filePart io.ReadCloser, fileName string, fileSize int64, formValues http.Header, err error) {
+func extractPostPolicyFormValues(ctx context.Context, form *multipart.Form) (filePart io.ReadCloser, fileName string, fileSize int64, formValues http.Header, err error) {
 	/// HTML Form values
 	fileName = ""
 
@@ -195,8 +270,21 @@ func extractPostPolicyFormValues(form *multipart.Form) (filePart io.ReadCloser, 
 	}
 
 	// Validate form values.
-	if err = validateFormFieldSize(formValues); err != nil {
+	if err = validateFormFieldSize(ctx, formValues); err != nil {
 		return nil, "", 0, nil, err
+	}
+
+	// this means that filename="" was not specified for file key and Go has
+	// an ugly way of handling this situation. Refer here
+	// https://golang.org/src/mime/multipart/formdata.go#L61
+	if len(form.File) == 0 {
+		var b = &bytes.Buffer{}
+		for _, v := range formValues["File"] {
+			b.WriteString(v)
+		}
+		fileSize = int64(b.Len())
+		filePart = ioutil.NopCloser(b)
+		return filePart, fileName, fileSize, formValues, nil
 	}
 
 	// Iterator until we find a valid File field and break
@@ -204,7 +292,8 @@ func extractPostPolicyFormValues(form *multipart.Form) (filePart io.ReadCloser, 
 		canonicalFormName := http.CanonicalHeaderKey(k)
 		if canonicalFormName == "File" {
 			if len(v) == 0 {
-				return nil, "", 0, nil, traceError(errInvalidArgument)
+				logger.LogIf(ctx, errInvalidArgument)
+				return nil, "", 0, nil, errInvalidArgument
 			}
 			// Fetch fileHeader which has the uploaded file information
 			fileHeader := v[0]
@@ -213,22 +302,77 @@ func extractPostPolicyFormValues(form *multipart.Form) (filePart io.ReadCloser, 
 			// Open the uploaded part
 			filePart, err = fileHeader.Open()
 			if err != nil {
-				return nil, "", 0, nil, traceError(err)
+				logger.LogIf(ctx, err)
+				return nil, "", 0, nil, err
 			}
 			// Compute file size
 			fileSize, err = filePart.(io.Seeker).Seek(0, 2)
 			if err != nil {
-				return nil, "", 0, nil, traceError(err)
+				logger.LogIf(ctx, err)
+				return nil, "", 0, nil, err
 			}
 			// Reset Seek to the beginning
 			_, err = filePart.(io.Seeker).Seek(0, 0)
 			if err != nil {
-				return nil, "", 0, nil, traceError(err)
+				logger.LogIf(ctx, err)
+				return nil, "", 0, nil, err
 			}
 			// File found and ready for reading
 			break
 		}
 	}
-
 	return filePart, fileName, fileSize, formValues, nil
+}
+
+// Log headers and body.
+func httpTraceAll(f http.HandlerFunc) http.HandlerFunc {
+	if globalHTTPTraceFile == nil {
+		return f
+	}
+	return httptracer.TraceReqHandlerFunc(f, globalHTTPTraceFile, true)
+}
+
+// Log only the headers.
+func httpTraceHdrs(f http.HandlerFunc) http.HandlerFunc {
+	if globalHTTPTraceFile == nil {
+		return f
+	}
+	return httptracer.TraceReqHandlerFunc(f, globalHTTPTraceFile, false)
+}
+
+// Returns "/bucketName/objectName" for path-style or virtual-host-style requests.
+func getResource(path string, host string, domains []string) (string, error) {
+	if len(domains) == 0 {
+		return path, nil
+	}
+	// If virtual-host-style is enabled construct the "resource" properly.
+	if strings.Contains(host, ":") {
+		// In bucket.mydomain.com:9000, strip out :9000
+		var err error
+		if host, _, err = net.SplitHostPort(host); err != nil {
+			reqInfo := (&logger.ReqInfo{}).AppendTags("host", host)
+			reqInfo.AppendTags("path", path)
+			ctx := logger.SetReqInfo(context.Background(), reqInfo)
+			logger.LogIf(ctx, err)
+			return "", err
+		}
+	}
+	for _, domain := range domains {
+		if !strings.HasSuffix(host, "."+domain) {
+			continue
+		}
+		bucket := strings.TrimSuffix(host, "."+domain)
+		return slashSeparator + pathJoin(bucket, path), nil
+	}
+	return path, nil
+}
+
+// If none of the http routes match respond with MethodNotAllowed, in JSON
+func notFoundHandlerJSON(w http.ResponseWriter, r *http.Request) {
+	writeErrorResponseJSON(context.Background(), w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL)
+}
+
+// If none of the http routes match respond with MethodNotAllowed
+func notFoundHandler(w http.ResponseWriter, r *http.Request) {
+	writeErrorResponse(context.Background(), w, errorCodes.ToAPIErr(ErrMethodNotAllowed), r.URL, guessIsBrowserReq(r))
 }

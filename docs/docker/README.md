@@ -4,28 +4,28 @@
 Docker installed on your machine. Download the relevant installer from [here](https://www.docker.com/community-edition#/download).
 
 ## Run Standalone Minio on Docker.
-Minio needs a persistent volume to store configuration and application data. However, for testing purposes, you can launch Minio by simply passing a directory (`/export` in the example below). This directory gets created in the container filesystem at the time of container start. But all the data is lost after container exits.
+Minio needs a persistent volume to store configuration and application data. However, for testing purposes, you can launch Minio by simply passing a directory (`/data` in the example below). This directory gets created in the container filesystem at the time of container start. But all the data is lost after container exits.
 
 ```sh
-docker run -p 9000:9000 minio/minio server /export
+docker run -p 9000:9000 minio/minio server /data
 ```
 
-To create a Minio container with persistent storage, you need to map local persistent directories from the host OS to virtual config `~/.minio` and export `/export` directories. To do this, run the below commands
+To create a Minio container with persistent storage, you need to map local persistent directories from the host OS to virtual config `~/.minio` and export `/data` directories. To do this, run the below commands
 
 #### GNU/Linux and macOS
 ```sh
 docker run -p 9000:9000 --name minio1 \
-  -v /mnt/export/minio1:/export \
-  -v /mnt/config/minio1:/root/.minio \
-  minio/minio server /export
+  -v /mnt/data:/data \
+  -v /mnt/config:/root/.minio \
+  minio/minio server /data
 ```
 
 #### Windows
 ```sh
 docker run -p 9000:9000 --name minio1 \
-  -v D:\export\minio1:/export \
-  -v D:\export\minio1-config:/root/.minio \
-  minio/minio server /export
+  -v D:\data:/data \
+  -v D:\minio\config:/root/.minio \
+  minio/minio server /data
 ```
 
 ## Run Distributed Minio on Docker
@@ -43,9 +43,9 @@ To override Minio's auto-generated keys, you may pass secret and access keys exp
 docker run -p 9000:9000 --name minio1 \
   -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
   -e "MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
-  -v /mnt/export/minio1:/export \
-  -v /mnt/config/minio1:/root/.minio \
-  minio/minio server /export
+  -v /mnt/data:/data \
+  -v /mnt/config:/root/.minio \
+  minio/minio server /data
 ```
 
 #### Windows
@@ -53,9 +53,9 @@ docker run -p 9000:9000 --name minio1 \
 docker run -p 9000:9000 --name minio1 \
   -e "MINIO_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE" \
   -e "MINIO_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" \
-  -v D:\export\minio1:/export \
-  -v D:\export\minio1-config:/root/.minio \
-  minio/minio server /export
+  -v D:\data:/data \
+  -v D:\minio\config:/root/.minio \
+  minio/minio server /data
 ```
 
 ### Minio Custom Access and Secret Keys using Docker secrets
@@ -68,10 +68,21 @@ echo "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" | docker secret create secret_ke
 
 Create a Minio service using `docker service` to read from Docker secrets.
 ```
-docker service create --name="minio-service" --secret="access_key" --secret="secret_key" minio/minio server /export
+docker service create --name="minio-service" --secret="access_key" --secret="secret_key" minio/minio server /data
 ```
 
 Read more about `docker service` [here](https://docs.docker.com/engine/swarm/how-swarm-mode-works/services/)
+
+#### Minio Custom Access and Secret Key files
+To use other secret names follow the instructions above and replace `access_key` and `secret_key` with your custom names (e.g. `my_secret_key`,`my_custom_key`). Run your service with
+```
+docker service create --name="minio-service" \
+  --secret="my_access_key" \
+  --secret="my_secret_key" \
+  --env="MINIO_ACCESS_KEY_FILE=my_access_key" \
+  --env="MINIO_SECRET_KEY_FILE=my_secret_key" \
+  minio/minio server /data
+```
 
 ### Retrieving Container ID
 To use Docker commands on a specific container, you need to know the `Container ID` for that container. To get the `Container ID`, run
